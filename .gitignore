@@ -5,3 +5,7 @@ docs/*
 ClAUDE.md
 CONTEXT.md
 plots/*
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
