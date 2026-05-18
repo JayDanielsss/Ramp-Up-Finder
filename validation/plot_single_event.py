@@ -18,6 +18,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import sys
 from pathlib import Path
@@ -185,12 +186,36 @@ def plot_pol_vs_time(rows: pd.DataFrame, title: str, qmeter_name: str) -> plt.Fi
     return fig
 
 
+def _load_candidate_row(csv_path: str, row_number: int) -> dict:
+    """Read a single row from a candidates.csv by 0-based row index."""
+    with open(csv_path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        rows = list(reader)
+    if row_number < 0 or row_number >= len(rows):
+        raise IndexError(
+            f"Row {row_number} is out of range — candidates.csv has {len(rows)} row(s) "
+            f"(valid indices: 0–{len(rows) - 1})"
+        )
+    return rows[row_number]
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("qmeter_name",
-                        help='QMeterName to match exactly, e.g. "Top Proton"')
-    parser.add_argument("event_name",
-                        help='Event directory name, e.g. "2004-04-10_08h25m37s"')
+    parser.add_argument("qmeter_name", nargs="?", default=None,
+                        help='QMeterName to match exactly, e.g. "Top Proton". '
+                             'Not required when --from-candidate is used.')
+    parser.add_argument("event_name", nargs="?", default=None,
+                        help='Event directory name, e.g. "2004-04-10_08h25m37s". '
+                             'Not required when --from-candidate is used.')
+    parser.add_argument(
+        "--from-candidate",
+        nargs=2,
+        metavar=("CSV_PATH", "ROW_NUMBER"),
+        default=None,
+        help="Read event_name, qmeter_name, start_index, and end_index from row "
+             "ROW_NUMBER (0-based) of a candidates.csv produced by scan_events.py. "
+             "Overrides positional arguments and sets --min-index/--max-index automatically.",
+    )
     parser.add_argument("--events-dir", type=Path, default=DEFAULT_EVENTS_DIR,
                         help="root directory containing event subdirs "
                              "(default: ../data/events relative to this script)")
@@ -227,6 +252,34 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s %(message)s",
     )
+
+    # Resolve --from-candidate, overriding positionals and index args
+    if args.from_candidate is not None:
+        csv_path, row_str = args.from_candidate
+        try:
+            row_number = int(row_str)
+        except ValueError:
+            logger.error("ROW_NUMBER must be an integer, got %r", row_str)
+            return 1
+        try:
+            cand = _load_candidate_row(csv_path, row_number)
+        except (FileNotFoundError, IndexError) as exc:
+            logger.error("%s", exc)
+            return 1
+        args.qmeter_name = cand["qmeter_name"]
+        args.event_name = cand["event_name"]
+        args.min_index = int(cand["start_index"])
+        args.max_index = int(cand["end_index"])
+        logger.info(
+            "Loaded candidate row %d: %s [%s] indices %s–%s",
+            row_number, args.event_name, args.qmeter_name,
+            args.min_index, args.max_index,
+        )
+    elif args.qmeter_name is None or args.event_name is None:
+        logger.error(
+            "qmeter_name and event_name are required unless --from-candidate is used."
+        )
+        return 1
 
     if args.min_freq > args.max_freq:
         logger.error("--min-freq (%g) must not exceed --max-freq (%g)",
