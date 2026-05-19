@@ -13,6 +13,8 @@ NMR raw-signal plot per row (default: '<event_name>_NMR_Signal.pdf').
 Example:
     python plot_single_event.py "Top Proton" 2004-04-10_08h25m37s \\
         --min-freq 140.0 --max-freq 140.3
+
+    
 """
 
 from __future__ import annotations
@@ -187,16 +189,24 @@ def plot_pol_vs_time(rows: pd.DataFrame, title: str, qmeter_name: str) -> plt.Fi
 
 
 def _load_candidate_row(csv_path: str, row_number: int) -> dict:
-    """Read a single row from a candidates.csv by 0-based row index."""
+    """Read a single row from a candidates.csv by 1-based line number (header = line 1)."""
     with open(csv_path, newline="") as fh:
         reader = csv.DictReader(fh)
         rows = list(reader)
-    if row_number < 0 or row_number >= len(rows):
+    data_index = row_number - 2
+    if data_index < 0 or data_index >= len(rows):
         raise IndexError(
-            f"Row {row_number} is out of range — candidates.csv has {len(rows)} row(s) "
-            f"(valid indices: 0–{len(rows) - 1})"
+            f"Line {row_number} is out of range — candidates.csv has {len(rows)} data row(s) "
+            f"(valid line numbers: 2–{len(rows) + 1})"
         )
-    return rows[row_number]
+    return rows[data_index]
+
+
+def _load_all_candidates(csv_path: str) -> list[dict]:
+    """Read all data rows from a candidates.csv."""
+    with open(csv_path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        return list(reader)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -209,12 +219,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              'Not required when --from-candidate is used.')
     parser.add_argument(
         "--from-candidate",
-        nargs=2,
-        metavar=("CSV_PATH", "ROW_NUMBER"),
+        nargs="+",
+        metavar="ARG",
         default=None,
-        help="Read event_name, qmeter_name, start_index, and end_index from row "
-             "ROW_NUMBER (0-based) of a candidates.csv produced by scan_events.py. "
-             "Overrides positional arguments and sets --min-index/--max-index automatically.",
+        help="CSV_PATH [ROW_NUMBER] — read from a candidates.csv produced by "
+             "scan_events.py (header = line 1, first data row = line 2). "
+             "With ROW_NUMBER: plot that single candidate (overrides positional "
+             "args and sets --min-index/--max-index automatically). "
+             "Without ROW_NUMBER: plot every candidate and write two PDFs "
+             "(pol_vs_freq and pol_vs_time) without showing the window.",
     )
     parser.add_argument("--events-dir", type=Path, default=DEFAULT_EVENTS_DIR,
                         help="root directory containing event subdirs "
@@ -255,14 +268,85 @@ def main(argv: list[str] | None = None) -> int:
 
     # Resolve --from-candidate, overriding positionals and index args
     if args.from_candidate is not None:
-        csv_path, row_str = args.from_candidate
+        if len(args.from_candidate) > 2:
+            logger.error("--from-candidate takes 1 or 2 arguments: CSV_PATH [ROW_NUMBER]")
+            return 1
+        csv_path_str = args.from_candidate[0]
+
+        if len(args.from_candidate) == 1:
+            # batch mode: plot every candidate and save to two PDFs
+            try:
+                all_cands = _load_all_candidates(csv_path_str)
+            except FileNotFoundError as exc:
+                logger.error("%s", exc)
+                return 1
+            if not all_cands:
+                logger.error("no candidates found in %s", csv_path_str)
+                return 2
+
+            plots_dir = Path("plots")
+            plots_dir.mkdir(exist_ok=True)
+            csv_stem = Path(csv_path_str).stem
+            freq_pdf_path = plots_dir / f"{csv_stem}_pol_vs_freq.pdf"
+            time_pdf_path = plots_dir / f"{csv_stem}_pol_vs_time.pdf"
+            freq_pages = time_pages = 0
+
+            with PdfPages(freq_pdf_path) as freq_out, PdfPages(time_pdf_path) as time_out:
+                for i, cand in enumerate(all_cands):
+                    cand_qmeter = cand["qmeter_name"]
+                    cand_event = cand["event_name"]
+                    cand_min_idx = int(cand["start_index"])
+                    cand_max_idx = int(cand["end_index"])
+                    event_dir = args.events_dir / cand_event
+                    if not event_dir.is_dir():
+                        logger.warning("event directory not found: %s — skipping", event_dir)
+                        continue
+                    try:
+                        rows = load_event_rows(event_dir, cand_qmeter,
+                                               min_freq=args.min_freq, max_freq=args.max_freq,
+                                               min_index=cand_min_idx, max_index=cand_max_idx)
+                    except (FileNotFoundError, ValueError) as exc:
+                        logger.warning("skipping %s: %s", cand_event, exc)
+                        continue
+                    if rows.empty:
+                        logger.warning("no matching rows for %s [%s] — skipping",
+                                       cand_event, cand_qmeter)
+                        continue
+                    if args.min_freq == args.max_freq:
+                        title = f"{cand_event}  (f = {args.min_freq:g} GHz)  [{cand_qmeter}]"
+                    else:
+                        title = (f"{cand_event}  ({args.min_freq:g} ≤ f ≤ {args.max_freq:g} GHz)"
+                                 f"  [{cand_qmeter}]")
+                    freq_fig = plot_pol_vs_freq(rows, title, cand_qmeter)
+                    freq_out.savefig(freq_fig)
+                    plt.close(freq_fig)
+                    freq_pages += 1
+                    time_fig = plot_pol_vs_time(rows, title, cand_qmeter)
+                    time_out.savefig(time_fig)
+                    plt.close(time_fig)
+                    time_pages += 1
+                    logger.debug("processed row %d: %s [%s]", i + 2, cand_event, cand_qmeter)
+                freq_out.infodict()["Title"] = f"Polarization vs uWaveFreq — {csv_stem}"
+                time_out.infodict()["Title"] = f"Polarization vs time — {csv_stem}"
+
+            for label, path, pages in (("freq", freq_pdf_path, freq_pages),
+                                        ("time", time_pdf_path, time_pages)):
+                if pages == 0:
+                    logger.warning("no pages for %s PDF — removing %s", label, path)
+                    path.unlink(missing_ok=True)
+                else:
+                    logger.info("wrote %d page(s) to %s", pages, path)
+            return 0 if (freq_pages or time_pages) else 2
+
+        # single-row mode
+        row_str = args.from_candidate[1]
         try:
             row_number = int(row_str)
         except ValueError:
             logger.error("ROW_NUMBER must be an integer, got %r", row_str)
             return 1
         try:
-            cand = _load_candidate_row(csv_path, row_number)
+            cand = _load_candidate_row(csv_path_str, row_number)
         except (FileNotFoundError, IndexError) as exc:
             logger.error("%s", exc)
             return 1
@@ -271,7 +355,7 @@ def main(argv: list[str] | None = None) -> int:
         args.min_index = int(cand["start_index"])
         args.max_index = int(cand["end_index"])
         logger.info(
-            "Loaded candidate row %d: %s [%s] indices %s–%s",
+            "Loaded candidate line %d: %s [%s] indices %s–%s",
             row_number, args.event_name, args.qmeter_name,
             args.min_index, args.max_index,
         )

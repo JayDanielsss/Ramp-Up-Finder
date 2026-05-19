@@ -3,12 +3,13 @@
 
 For each subdirectory of ../data/events/ named like 'YYYY-MM-DD_HHhMMmSSs'
 (ignoring '*Base', '*RawSignal', '*PolySignal' variants), reads the matching
-'<dir>/<dir>.csv' and writes two multi-page PDFs:
+'<dir>/<dir>.csv' and writes three multi-page PDFs:
 
-  * <qmeter>_pol_vs_freq.pdf — Polarization vs uWaveFreq (one page per event)
-  * <qmeter>_pol_vs_time.pdf — Polarization vs row index (proxy for time)
+  * <qmeter>_pol_vs_freq.pdf  — Polarization vs uWaveFreq (one page per event)
+  * <qmeter>_pol_vs_time.pdf  — Polarization vs row index (proxy for time)
+  * <qmeter>_freq_vs_time.pdf — uWaveFreq vs row index (proxy for time)
 
-Both PDFs use the same row filter: numeric Polarization, numeric uWaveFreq,
+All PDFs use the same row filter: numeric Polarization, numeric uWaveFreq,
 and uWaveFreq strictly greater than MIN_FREQ (default 138 GHz).
 """
 
@@ -116,21 +117,44 @@ def plot_pol_vs_time(rows: pd.DataFrame, title: str, qmeter_name: str) -> plt.Fi
     return fig
 
 
+def plot_freq_vs_time(rows: pd.DataFrame, title: str, qmeter_name: str) -> plt.Figure | None:
+    """uWaveFreq vs row index (time proxy)."""
+    if rows.empty:
+        return None
+    series = rows["uWaveFreq"].reset_index(drop=True)
+
+    fig, ax = plt.subplots(figsize=(8.5, 5.5))
+    ax.plot(series.index, series.values, marker="o", linestyle="-",
+            markersize=3, linewidth=0.8)
+    ax.set_title(title)
+    ax.set_xlabel("Row index (time)")
+    ax.set_ylabel("uWaveFreq")
+    ax.grid(True, alpha=0.3)
+    ax.text(0.99, 0.01, f"QMeter: {qmeter_name}  (n={len(series)})",
+            transform=ax.transAxes, ha="right", va="bottom", fontsize=8,
+            color="gray")
+    fig.tight_layout()
+    return fig
+
+
 def build_pdfs(qmeter_name: str, events_dir: Path,
-               freq_pdf: Path, time_pdf: Path,
-               min_freq: float = DEFAULT_MIN_FREQ) -> tuple[int, int]:
-    """Write both PDFs. Returns (freq_pages, time_pages)."""
+               freq_pdf: Path, time_pdf: Path, freq_time_pdf: Path,
+               min_freq: float = DEFAULT_MIN_FREQ) -> tuple[int, int, int]:
+    """Write all three PDFs. Returns (freq_pages, time_pages, freq_time_pages)."""
     event_dirs = find_event_dirs(events_dir)
     logger.info("scanning %d event directories under %s (uWaveFreq > %g)",
                 len(event_dirs), events_dir, min_freq)
 
-    freq_pdf.parent.mkdir(parents=True, exist_ok=True)
-    time_pdf.parent.mkdir(parents=True, exist_ok=True)
+    for p in (freq_pdf, time_pdf, freq_time_pdf):
+        p.parent.mkdir(parents=True, exist_ok=True)
 
     freq_pages = 0
     time_pages = 0
+    freq_time_pages = 0
 
-    with PdfPages(freq_pdf) as freq_out, PdfPages(time_pdf) as time_out:
+    with (PdfPages(freq_pdf) as freq_out,
+          PdfPages(time_pdf) as time_out,
+          PdfPages(freq_time_pdf) as freq_time_out):
         for event_dir in event_dirs:
             rows = load_event_rows(event_dir, qmeter_name, min_freq=min_freq)
             if rows.empty:
@@ -148,14 +172,23 @@ def build_pdfs(qmeter_name: str, events_dir: Path,
                 plt.close(time_fig)
                 time_pages += 1
 
-            logger.debug("processed %s (freq=%s, time=%s)", event_dir.name,
+            freq_time_fig = plot_freq_vs_time(rows, event_dir.name, qmeter_name)
+            if freq_time_fig is not None:
+                freq_time_out.savefig(freq_time_fig)
+                plt.close(freq_time_fig)
+                freq_time_pages += 1
+
+            logger.debug("processed %s (pol_freq=%s, pol_time=%s, freq_time=%s)",
+                         event_dir.name,
                          "yes" if freq_fig else "no",
-                         "yes" if time_fig else "no")
+                         "yes" if time_fig else "no",
+                         "yes" if freq_time_fig else "no")
 
         freq_out.infodict()["Title"] = f"Polarization vs uWaveFreq — {qmeter_name}"
         time_out.infodict()["Title"] = f"Polarization vs time — {qmeter_name}"
+        freq_time_out.infodict()["Title"] = f"uWaveFreq vs time — {qmeter_name}"
 
-    return freq_pages, time_pages
+    return freq_pages, time_pages, freq_time_pages
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -171,6 +204,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--output-time", type=Path, default=None,
                         help="output PDF for polarization vs time index "
                              "(default: <qmeter>_pol_vs_time.pdf)")
+    parser.add_argument("--output-freq-time", type=Path, default=None,
+                        help="output PDF for uWaveFreq vs time index "
+                             "(default: <qmeter>_freq_vs_time.pdf)")
     parser.add_argument("--min-freq", type=float, default=DEFAULT_MIN_FREQ,
                         help=f"keep only rows with uWaveFreq strictly greater "
                              f"than this value (default: {DEFAULT_MIN_FREQ})")
@@ -187,27 +223,30 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     slug = args.qmeter_name.replace(" ", "_")
-    freq_pdf = args.output_freq or Path(f"{slug}_pol_vs_freq.pdf")
-    time_pdf = args.output_time or Path(f"{slug}_pol_vs_time.pdf")
+    plots_dir = Path(__file__).parent / "plots"
+    freq_pdf = args.output_freq or plots_dir / f"{slug}_pol_vs_freq.pdf"
+    time_pdf = args.output_time or plots_dir / f"{slug}_pol_vs_time.pdf"
+    freq_time_pdf = args.output_freq_time or plots_dir / f"{slug}_freq_vs_time.pdf"
 
     try:
-        freq_pages, time_pages = build_pdfs(
-            args.qmeter_name, args.events_dir, freq_pdf, time_pdf,
+        freq_pages, time_pages, freq_time_pages = build_pdfs(
+            args.qmeter_name, args.events_dir, freq_pdf, time_pdf, freq_time_pdf,
             min_freq=args.min_freq,
         )
     except FileNotFoundError as exc:
         logger.error("%s", exc)
         return 1
 
-    for label, path, pages in (("freq", freq_pdf, freq_pages),
-                               ("time", time_pdf, time_pages)):
+    for label, path, pages in (("pol_vs_freq", freq_pdf, freq_pages),
+                               ("pol_vs_time", time_pdf, time_pages),
+                               ("freq_vs_time", freq_time_pdf, freq_time_pages)):
         if pages == 0:
             logger.warning("no matching rows for %s PDF — removing %s", label, path)
             path.unlink(missing_ok=True)
         else:
             logger.info("wrote %d page(s) to %s", pages, path)
 
-    return 0 if (freq_pages or time_pages) else 2
+    return 0 if (freq_pages or time_pages or freq_time_pages) else 2
 
 
 if __name__ == "__main__":

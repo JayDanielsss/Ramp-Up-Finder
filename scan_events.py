@@ -38,10 +38,10 @@ CANDIDATES_FILENAME = "candidates.csv"
 
 QMETER_CONFIG: dict[str, dict] = {
     "Top Proton": {
-        "start_threshold": 0.05,
-        "min_end_pol": 0.20,
-        "min_ramp_rows": 100,
-        "monotonicity_fraction": 0.85,
+        "start_threshold": 1,
+        "min_end_pol": 30,
+        "min_ramp_rows": 60,
+        "monotonicity_fraction": 0.50,          #How clean the ramp up must be. 
     },
 }
 
@@ -135,6 +135,12 @@ def _scan_event(event_dir: Path, qmeters: dict[str, dict]) -> list[dict]:
             continue
 
         candidates = detect_ramp_ups(df["Polarization"], config)
+        if "min_end_pol" in config:
+            max_end_pol = -config["min_end_pol"]
+            candidates = [
+                c for c in candidates
+                if c.direction != -1 or c.max_polarization <= max_end_pol
+            ]
         logger.debug("%s [%s]: %d candidate(s) found", event_dir.name, qmeter_name, len(candidates))
         for c in candidates:
             rows.append({
