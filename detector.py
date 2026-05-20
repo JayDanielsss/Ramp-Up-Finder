@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
+from scipy.signal import find_peaks
 
 
 @dataclass
@@ -11,26 +12,24 @@ class Candidate:
     start_index: int
     end_index: int
     direction: int                  # +1 or -1
+    start_polarization: float
+    end_polarization: float
+    swing: float                    # end_polarization - start_polarization
     max_polarization: float         # signed value with maximum absolute magnitude
     monotonicity_fraction: float
 
 
 def detect_ramp_ups(polarization_series: pd.Series, config: dict) -> list[Candidate]:
-    """Detect ramp-up windows in a polarization series using the anchor+grow algorithm.
+    """Detect ramp-up windows using a two-pass prominence-based segmenter.
+
+    Pass 1: find boundary indices from prominent peaks/troughs plus series endpoints.
+    Pass 2: form one candidate per adjacent boundary pair; keep if it passes
+    min_ramp_rows, min_swing, and monotonicity_fraction thresholds.
 
     Pure function — no file I/O or side effects.
-
-    Args:
-        polarization_series: pd.Series of float polarization values (already filtered
-            for one QMeter and frequency range).
-        config: QMeter threshold dict with keys start_threshold, min_end_pol,
-            min_ramp_rows, monotonicity_fraction.
-
-    Returns:
-        List of Candidate objects; empty if none found.
     """
-    start_threshold = config["start_threshold"]
-    min_end_pol = config["min_end_pol"]
+    prominence = config["prominence"]
+    min_swing = config["min_swing"]
     min_ramp_rows = config["min_ramp_rows"]
     mono_threshold = config["monotonicity_fraction"]
 
@@ -40,69 +39,49 @@ def detect_ramp_ups(polarization_series: pd.Series, config: dict) -> list[Candid
         dtype=float,
     )
     n = len(pol)
+    if n < 2:
+        return []
+
+    # Pass 1 — find boundaries
+    peaks_pos, _ = find_peaks(pol, prominence=prominence)
+    peaks_neg, _ = find_peaks(-pol, prominence=prominence)
+    boundaries = sorted(set([0, n - 1]) | set(peaks_pos.tolist()) | set(peaks_neg.tolist()))
+
+    # Pass 2 — segment and filter
     candidates: list[Candidate] = []
+    for i in range(len(boundaries) - 1):
+        start_idx = boundaries[i]
+        end_idx = boundaries[i + 1]
+        window = pol[start_idx: end_idx + 1]
+        window_len = end_idx - start_idx + 1
 
-    i = 0
-    while i < n - 1:
-        # --- find anchor ---
-        if abs(pol[i]) > start_threshold:
-            i += 1
-            continue
+        start_pol = float(pol[start_idx])
+        end_pol = float(pol[end_idx])
+        swing = end_pol - start_pol
+        direction = 1 if swing >= 0 else -1
 
-        anchor = i
+        deltas = np.diff(window)
+        total = len(deltas)
+        if total > 0:
+            agree = int(np.sum(deltas > 0) if direction == 1 else np.sum(deltas < 0))
+            mono_frac = agree / total
+        else:
+            mono_frac = 0.0
 
-        # Determine direction from first non-zero delta after anchor.
-        direction = 0
-        for k in range(anchor + 1, min(anchor + 50, n)):
-            delta = pol[k] - pol[k - 1]
-            if delta != 0.0:
-                direction = 1 if delta > 0 else -1
-                break
-
-        if direction == 0:
-            i += 1
-            continue
-
-        # --- grow forward ---
-        agree = 0
-        total = 0
-        prev_agree = 0
-        prev_total = 0
-        end = anchor
-
-        for j in range(anchor + 1, n):
-            delta = pol[j] - pol[j - 1]
-            prev_agree, prev_total = agree, total
-            if (direction == 1 and delta > 0) or (direction == -1 and delta < 0):
-                agree += 1
-            total += 1
-
-            frac = agree / total
-            if frac < mono_threshold:
-                # Ramp broken — restore counts from before this step
-                agree, total = prev_agree, prev_total
-                end = j - 1
-                break
-
-            end = j
-
-        # --- evaluate candidate ---
-        window_len = end - anchor + 1
-        window = pol[anchor: end + 1]
         max_pol = float(window[np.argmax(np.abs(window))])
-        mono_frac = agree / total if total > 0 else 0.0
 
         if (window_len >= min_ramp_rows
-                and abs(max_pol) >= min_end_pol
+                and abs(swing) >= min_swing
                 and mono_frac >= mono_threshold):
             candidates.append(Candidate(
-                start_index=anchor,
-                end_index=end,
+                start_index=start_idx,
+                end_index=end_idx,
                 direction=direction,
+                start_polarization=start_pol,
+                end_polarization=end_pol,
+                swing=swing,
                 max_polarization=max_pol,
                 monotonicity_fraction=mono_frac,
             ))
-
-        i = end + 1
 
     return candidates

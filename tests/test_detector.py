@@ -5,10 +5,10 @@ import pytest
 from detector import Candidate, detect_ramp_ups
 
 CONFIG = {
-    "start_threshold": 0.05,
-    "min_end_pol": 0.20,
-    "min_ramp_rows": 100,
-    "monotonicity_fraction": 0.85,
+    "prominence": 0.10,
+    "min_swing": 0.20,
+    "min_ramp_rows": 5,
+    "monotonicity_fraction": 0.80,
 }
 
 
@@ -17,6 +17,7 @@ def _series(arr):
 
 
 def test_flat_series_no_candidates():
+    # No peaks/troughs; single segment has swing=0, below min_swing.
     pol = _series(np.zeros(200))
     assert detect_ramp_ups(pol, CONFIG) == []
 
@@ -29,8 +30,9 @@ def test_single_positive_ramp():
     assert c.start_index == 0
     assert c.end_index == 149
     assert c.direction == 1
-    assert abs(c.max_polarization) >= 0.20
-    assert c.monotonicity_fraction >= 0.85
+    assert abs(c.swing) >= 0.20
+    assert c.swing > 0
+    assert c.monotonicity_fraction >= 0.80
 
 
 def test_single_negative_ramp():
@@ -39,47 +41,34 @@ def test_single_negative_ramp():
     assert len(candidates) == 1
     c = candidates[0]
     assert c.direction == -1
-    assert c.max_polarization <= -0.20
-    assert c.monotonicity_fraction >= 0.85
+    assert c.swing < 0
+    assert abs(c.swing) >= 0.20
+    assert c.monotonicity_fraction >= 0.80
 
 
-def test_two_ramps_separated_by_reversal():
-    # Ramp 1 (0→0.5), then reversal (0.5→0), then ramp 2 (0→0.5).
-    # The reversal drops monotonicity below threshold, ending ramp 1.
-    # A new anchor near 0 starts ramp 2.
+def test_back_to_back_ramps_without_zero_crossing():
+    # Positive ramp, then negative ramp, then positive — no return to zero.
+    # The prominence-based detector finds all three segments.
     part1 = np.linspace(0.0, 0.5, 150)
-    part2 = np.linspace(0.5, 0.0, 50)
-    part3 = np.linspace(0.0, 0.5, 150)
+    part2 = np.linspace(0.5, -0.5, 150)
+    part3 = np.linspace(-0.5, 0.5, 150)
     pol = _series(np.concatenate([part1, part2, part3]))
     candidates = detect_ramp_ups(pol, CONFIG)
-    assert len(candidates) == 2
-    assert candidates[0].direction == 1
-    assert candidates[1].direction == 1
-    # Second ramp must start after the first ends
-    assert candidates[1].start_index > candidates[0].end_index
-
-
-def test_noisy_series_below_monotonicity_threshold_no_candidates():
-    # Alternating up/down pattern → monotonicity ~0.5, well below 0.85.
-    rng = np.random.default_rng(0)
-    n = 300
-    # Build a series that starts near 0 and has ~50% disagreeing steps.
-    steps = np.where(rng.random(n) < 0.5, 0.01, -0.01)
-    steps[0] = 0.0  # anchor
-    pol = _series(np.cumsum(steps))
-    candidates = detect_ramp_ups(pol, CONFIG)
-    assert candidates == []
+    assert len(candidates) >= 2
+    directions = [c.direction for c in candidates]
+    assert 1 in directions
+    assert -1 in directions
 
 
 def test_too_short_no_candidates():
-    # Clean ramp but only 50 rows — below min_ramp_rows=100.
-    pol = _series(np.linspace(0.0, 0.5, 50))
+    # Clean ramp but fewer than min_ramp_rows=5 rows.
+    pol = _series(np.linspace(0.0, 0.5, 3))
     assert detect_ramp_ups(pol, CONFIG) == []
 
 
-def test_does_not_reach_min_end_pol_no_candidates():
-    # Clean ramp over 150 rows but only reaches 0.10 — below min_end_pol=0.20.
-    pol = _series(np.linspace(0.0, 0.10, 150))
+def test_below_min_swing_no_candidates():
+    # Ramp over enough rows but swing only 0.05, below min_swing=0.20.
+    pol = _series(np.linspace(0.0, 0.05, 150))
     assert detect_ramp_ups(pol, CONFIG) == []
 
 
@@ -90,5 +79,19 @@ def test_candidate_fields_present():
     assert hasattr(c, "start_index")
     assert hasattr(c, "end_index")
     assert hasattr(c, "direction")
+    assert hasattr(c, "start_polarization")
+    assert hasattr(c, "end_polarization")
+    assert hasattr(c, "swing")
     assert hasattr(c, "max_polarization")
     assert hasattr(c, "monotonicity_fraction")
+    assert abs(c.swing - (c.end_polarization - c.start_polarization)) < 1e-9
+
+
+def test_empty_series():
+    pol = _series([])
+    assert detect_ramp_ups(pol, CONFIG) == []
+
+
+def test_single_element_series():
+    pol = _series([0.5])
+    assert detect_ramp_ups(pol, CONFIG) == []

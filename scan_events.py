@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Batch-scan all event directories for ramp-up candidates.
 
-Iterates over every subdirectory in events_dir, applies the anchor+grow
+Iterates over every subdirectory in events_dir, applies the prominence-based
 detector per QMeter, and appends new results to candidates.csv (skipping
 duplicates by event_name + index range). Use --auto-extract to write slices
 to rampUps/ during a scan, or --extract-from-csv to extract from an
@@ -38,10 +38,10 @@ CANDIDATES_FILENAME = "candidates.csv"
 
 QMETER_CONFIG: dict[str, dict] = {
     "Top Proton": {
-        "start_threshold": 1,
-        "min_end_pol": 30,
-        "min_ramp_rows": 60,
-        "monotonicity_fraction": 0.50,          #How clean the ramp up must be. 
+        "prominence": 5,
+        "min_swing": 10,
+        "min_ramp_rows": 5,
+        "monotonicity_fraction": 0.25,
     },
 }
 
@@ -51,6 +51,9 @@ CANDIDATE_FIELDS = [
     "start_index",
     "end_index",
     "direction",
+    "start_polarization",
+    "end_polarization",
+    "swing",
     "max_polarization",
     "monotonicity_fraction",
     "accepted",  # N by default; set to Y to approve for extraction
@@ -135,12 +138,6 @@ def _scan_event(event_dir: Path, qmeters: dict[str, dict]) -> list[dict]:
             continue
 
         candidates = detect_ramp_ups(df["Polarization"], config)
-        if "min_end_pol" in config:
-            max_end_pol = -config["min_end_pol"]
-            candidates = [
-                c for c in candidates
-                if c.direction != -1 or c.max_polarization <= max_end_pol
-            ]
         logger.debug("%s [%s]: %d candidate(s) found", event_dir.name, qmeter_name, len(candidates))
         for c in candidates:
             rows.append({
@@ -149,6 +146,9 @@ def _scan_event(event_dir: Path, qmeters: dict[str, dict]) -> list[dict]:
                 "start_index": c.start_index,
                 "end_index": c.end_index,
                 "direction": c.direction,
+                "start_polarization": c.start_polarization,
+                "end_polarization": c.end_polarization,
+                "swing": c.swing,
                 "max_polarization": c.max_polarization,
                 "monotonicity_fraction": c.monotonicity_fraction,
                 "accepted": "N",
