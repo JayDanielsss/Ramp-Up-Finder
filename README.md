@@ -58,11 +58,13 @@ python scan_events.py --qmeter "Top Proton" --auto-extract
 
 ## scan_events.py
 
-Batch-scans all event directories for ramp-up candidates using the anchor+grow algorithm. Appends new results to `candidates.csv`, skipping duplicates by `(event_name, start_index, end_index)`. Supports extracting approved slices to `rampUps/` without re-scanning.
+Batch-scans all event directories for ramp-up candidates using the prominence-based segmenter. Appends new results to `candidates.csv`, skipping duplicates by `(event_name, start_index, end_index)`. Supports extracting approved slices to `rampUps/` without re-scanning.
 
 **candidates.csv schema:**
 ```
-event_name, qmeter_name, start_index, end_index, direction, max_polarization, monotonicity_fraction, accepted
+event_name, qmeter_name, start_index, end_index, direction,
+start_polarization, end_polarization, swing,
+max_polarization, monotonicity_fraction, accepted
 ```
 `accepted` defaults to `N`; set to `Y` to approve a candidate for extraction.
 
@@ -90,13 +92,21 @@ python scan_events.py --qmeter "Top Proton"
 python scan_events.py --qmeter "Top Proton" --auto-extract
 python scan_events.py --extract-from-csv candidates.csv
 python scan_events.py --dry-run
+
+# Preview candidates for a single event without writing any files:
+python scan_events.py --dry-run \
+    --events-dir /path/to/data/events/2004-08-03_10h29m47s/..
 ```
 
 ---
 
 ## detector.py
 
-Core ramp-up detection module. Implements the anchor+grow algorithm as a pure function with no file I/O.
+Core ramp-up detection module. Implements a two-pass prominence-based segmenter as a pure function with no file I/O.
+
+**Algorithm:**
+1. **Pass 1 — find boundaries.** `scipy.signal.find_peaks` locates prominent maxima and minima; series endpoints are always included.
+2. **Pass 2 — segment and filter.** One candidate per adjacent boundary pair, kept if it meets `min_ramp_rows`, `|swing| ≥ min_swing`, and `monotonicity_fraction` thresholds.
 
 **Interface:**
 ```python
@@ -105,16 +115,17 @@ from detector import detect_ramp_ups, Candidate
 candidates = detect_ramp_ups(polarization_series, config)
 # returns list[Candidate], each with:
 #   start_index, end_index, direction (+1/-1),
+#   start_polarization, end_polarization, swing,
 #   max_polarization, monotonicity_fraction
 ```
 
 **Config dict** (per QMeter, from `QMETER_CONFIG` in `scan_events.py`):
 ```python
 {
-    "start_threshold": 0.05,       # |pol| must be <= this to anchor
-    "min_end_pol": 0.20,           # |max_pol| must exceed this
-    "min_ramp_rows": 100,          # minimum window length
-    "monotonicity_fraction": 0.85, # fraction of steps in the ramp direction
+    "prominence": 5,               # min peak/trough prominence to use as a boundary
+    "min_swing": 10,               # |end_pol - start_pol| must exceed this
+    "min_ramp_rows": 5,            # minimum segment length in rows
+    "monotonicity_fraction": 0.25, # fraction of steps in the ramp direction
 }
 ```
 
@@ -165,7 +176,7 @@ Tests: `pytest tests/test_nmr_gaussian.py`
 pytest tests/
 ```
 
-19 tests covering the detector, feature extractor, and Gaussian scorer.
+20 tests covering the detector, feature extractor, and Gaussian scorer.
 
 ---
 
