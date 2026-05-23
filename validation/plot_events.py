@@ -23,7 +23,11 @@ from pathlib import Path
 
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.ticker import FormatStrFormatter
+
+from time_utils import EASTERN
 
 EVENT_DIR_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}_\d{2}h\d{2}m\d{2}s$")
 EXCLUDED_SUFFIXES = ("Base", "RawSignal", "PolySignal")
@@ -48,40 +52,69 @@ def find_event_dirs(events_dir: Path) -> list[Path]:
     return sorted(dirs, key=lambda p: p.name)
 
 
+EMPTY_COLUMNS = ["uWaveFreq", "Polarization", "EventNum", "csv_line", "Timestamp"]
+
+
 def load_event_rows(event_dir: Path, qmeter_name: str,
                     min_freq: float = DEFAULT_MIN_FREQ) -> pd.DataFrame:
-    """Load rows for qmeter_name with numeric Polarization and uWaveFreq > min_freq.
+    """Load rows for qmeter_name with numeric Polarization, uWaveFreq > min_freq,
+    and a tz-aware Eastern Timestamp derived from EventNum.
 
-    Preserves original CSV row order. Returns an empty frame when the CSV is
-    missing, unreadable, lacks required columns, or has no matching rows.
+    Preserves original CSV row order and tags each row with its source CSV line
+    number (header = line 1, first data row = line 2). Returns an empty frame
+    when the CSV is missing, unreadable, lacks required columns, or has no
+    matching rows.
     """
     csv_path = event_dir / f"{event_dir.name}.csv"
     if not csv_path.is_file():
-        return pd.DataFrame(columns=["uWaveFreq", "Polarization"])
+        return pd.DataFrame(columns=EMPTY_COLUMNS)
 
     try:
         df = pd.read_csv(csv_path, engine="python", on_bad_lines="skip")
     except (pd.errors.ParserError, UnicodeDecodeError, OSError) as exc:
         logger.warning("skipping %s: %s", csv_path.name, exc)
-        return pd.DataFrame(columns=["uWaveFreq", "Polarization"])
+        return pd.DataFrame(columns=EMPTY_COLUMNS)
 
-    required = {"QMeterName", "Polarization", "uWaveFreq"}
+    df["csv_line"] = df.index + 2
+
+    required = {"QMeterName", "Polarization", "uWaveFreq", "EventNum"}
     if not required.issubset(df.columns):
-        return pd.DataFrame(columns=["uWaveFreq", "Polarization"])
+        return pd.DataFrame(columns=EMPTY_COLUMNS)
 
-    matched = df.loc[df["QMeterName"] == qmeter_name, ["uWaveFreq", "Polarization"]].copy()
+    cols = ["uWaveFreq", "Polarization", "EventNum", "csv_line"]
+    matched = df.loc[df["QMeterName"] == qmeter_name, cols].copy()
     matched["uWaveFreq"] = pd.to_numeric(matched["uWaveFreq"], errors="coerce")
     matched["Polarization"] = pd.to_numeric(matched["Polarization"], errors="coerce")
-    matched = matched.dropna(subset=["uWaveFreq", "Polarization"])
+    matched["EventNum"] = pd.to_numeric(matched["EventNum"], errors="coerce")
+    matched = matched.dropna(subset=["uWaveFreq", "Polarization", "EventNum"])
     matched = matched[matched["uWaveFreq"] > min_freq]
+    matched["Timestamp"] = pd.to_datetime(matched["EventNum"], unit="s", utc=True
+                                          ).dt.tz_convert(EASTERN)
     return matched.reset_index(drop=True)
+
+
+def _add_index_axis(ax: plt.Axes, n: int, start: int = 0, end: int | None = None) -> None:
+    """Attach a secondary x-axis at the bottom of *ax* showing CSV line numbers.
+
+    *start* and *end* are the first and last line numbers of the data window.
+    *end* defaults to ``start + n - 1`` when omitted.
+    """
+    hi = end if end is not None else start + n - 1
+    ax2 = ax.twiny()
+    ax2.set_xlim(start, max(hi, start + 1))
+    ax2.xaxis.set_ticks_position("bottom")
+    ax2.xaxis.set_label_position("bottom")
+    ax2.spines["bottom"].set_position(("outward", 48))
+    ax2.spines["top"].set_visible(False)
+    ax2.set_xlabel("Line", fontsize=9)
+    ax2.tick_params(axis="x", labelsize=8)
 
 
 def plot_pol_vs_freq(rows: pd.DataFrame, title: str, qmeter_name: str) -> plt.Figure | None:
     """Polarization vs uWaveFreq."""
     if rows.empty:
         return None
-    pairs = rows.sort_values("uWaveFreq")
+    pairs = rows.sort_values("uWaveFreq", labelpad=30)
 
     fig, ax = plt.subplots(figsize=(8.5, 5.5))
     ax.plot(pairs["uWaveFreq"], pairs["Polarization"], marker="o", linestyle="-",
@@ -89,51 +122,73 @@ def plot_pol_vs_freq(rows: pd.DataFrame, title: str, qmeter_name: str) -> plt.Fi
     ax.set_title(title)
     ax.set_xlabel("uWaveFreq")
     ax.set_ylabel("Polarization")
+    ax.xaxis.set_major_formatter(FormatStrFormatter("%.6f"))
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
     ax.grid(True, alpha=0.3)
     ax.text(0.99, 0.01, f"QMeter: {qmeter_name}  (n={len(pairs)})",
             transform=ax.transAxes, ha="right", va="bottom", fontsize=8,
             color="gray")
+    line_start = int(pairs["csv_line"].min()) if not pairs.empty else 0
+    line_end   = int(pairs["csv_line"].max()) if not pairs.empty else 0
+    _add_index_axis(ax, len(pairs), start=line_start, end=line_end)
     fig.tight_layout()
+    fig.subplots_adjust(bottom=0.22)
     return fig
 
 
+def _format_time_axis(ax) -> None:
+    locator = mdates.AutoDateLocator()
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator, tz=EASTERN))
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+
+
 def plot_pol_vs_time(rows: pd.DataFrame, title: str, qmeter_name: str) -> plt.Figure | None:
-    """Polarization vs row index (time proxy)."""
+    """Polarization vs Eastern timestamp (from EventNum)."""
     if rows.empty:
         return None
-    series = rows["Polarization"].reset_index(drop=True)
 
     fig, ax = plt.subplots(figsize=(8.5, 5.5))
-    ax.plot(series.index, series.values, marker="o", linestyle="-",
+    ax.plot(rows["Timestamp"], rows["Polarization"], marker="o", linestyle="-",
             markersize=3, linewidth=0.8)
     ax.set_title(title)
-    ax.set_xlabel("Row index (time)")
+    ax.set_xlabel("Time (Eastern)")
     ax.set_ylabel("Polarization")
+    _format_time_axis(ax)
     ax.grid(True, alpha=0.3)
-    ax.text(0.99, 0.01, f"QMeter: {qmeter_name}  (n={len(series)})",
+    ax.text(0.99, 0.01, f"QMeter: {qmeter_name}  (n={len(rows)})",
             transform=ax.transAxes, ha="right", va="bottom", fontsize=8,
             color="gray")
+    line_start = int(rows["csv_line"].min()) if not rows.empty else 0
+    line_end   = int(rows["csv_line"].max()) if not rows.empty else 0
+    _add_index_axis(ax, len(rows), start=line_start, end=line_end)
     fig.tight_layout()
+    fig.subplots_adjust(bottom=0.22)
     return fig
 
 
 def plot_freq_vs_time(rows: pd.DataFrame, title: str, qmeter_name: str) -> plt.Figure | None:
-    """uWaveFreq vs row index (time proxy)."""
+    """uWaveFreq vs Eastern timestamp (from EventNum)."""
     if rows.empty:
         return None
-    series = rows["uWaveFreq"].reset_index(drop=True)
 
     fig, ax = plt.subplots(figsize=(8.5, 5.5))
-    ax.plot(series.index, series.values, marker="o", linestyle="-",
+    ax.plot(rows["Timestamp"], rows["uWaveFreq"], marker="o", linestyle="-",
             markersize=3, linewidth=0.8)
     ax.set_title(title)
-    ax.set_xlabel("Row index (time)")
+    ax.set_xlabel("Time (Eastern)")
     ax.set_ylabel("uWaveFreq")
+    ax.yaxis.set_major_formatter(FormatStrFormatter("%.6f"))
+    _format_time_axis(ax)
     ax.grid(True, alpha=0.3)
-    ax.text(0.99, 0.01, f"QMeter: {qmeter_name}  (n={len(series)})",
+    ax.text(0.99, 0.01, f"QMeter: {qmeter_name}  (n={len(rows)})",
             transform=ax.transAxes, ha="right", va="bottom", fontsize=8,
             color="gray")
+    line_start = int(rows["csv_line"].min()) if not rows.empty else 0
+    line_end   = int(rows["csv_line"].max()) if not rows.empty else 0
+    _add_index_axis(ax, len(rows), start=line_start, end=line_end)
     fig.tight_layout()
+    fig.subplots_adjust(bottom=0.22)
     return fig
 
 

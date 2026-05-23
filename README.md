@@ -18,6 +18,7 @@ validation/
     plots/
     plot_events.py
     plot_single_event.py
+    time_utils.py
 ```
 
 ---
@@ -34,9 +35,13 @@ Writes new candidates to `candidates.csv` (duplicates skipped automatically).
 
 **Step 2: Review candidates**
 ```
-python validation/plot_single_event.py --from-candidate candidates.csv 0 --no-nmr-pdf
-python validation/plot_single_event.py --from-candidate candidates.csv 1 --no-nmr-pdf
-# ... repeat for each row
+# polarization plots only (fast)
+python validation/plot_single_event.py --from-candidate candidates.csv 2
+python validation/plot_single_event.py --from-candidate candidates.csv 3
+# ... repeat for each row (header = line 1, first data row = line 2)
+
+# include NMR raw-signal PDF (±5 rows around peak polarization)
+python validation/plot_single_event.py --from-candidate candidates.csv 2 --nmr
 ```
 
 **Step 3: Mark approved candidates**
@@ -58,14 +63,16 @@ python scan_events.py --qmeter "Top Proton" --auto-extract
 
 ## scan_events.py
 
-Batch-scans all event directories for ramp-up candidates using the prominence-based segmenter. Appends new results to `candidates.csv`, skipping duplicates by `(event_name, start_index, end_index)`. Supports extracting approved slices to `rampUps/` without re-scanning.
+Batch-scans all event directories for ramp-up candidates using the prominence-based segmenter. Appends new results to `candidates.csv`, skipping duplicates by `(event_name, start_line, end_line)`. Supports extracting approved slices to `rampUps/` without re-scanning.
 
 **candidates.csv schema:**
 ```
-event_name, qmeter_name, start_index, end_index, direction,
+event_name, qmeter_name, start_line, end_line, direction,
 start_polarization, end_polarization, swing,
 max_polarization, monotonicity_fraction, accepted
 ```
+`start_line`/`end_line` are 1-based line numbers in the source event CSV (header = line 1).
+
 `accepted` defaults to `N`; set to `Y` to approve a candidate for extraction.
 
 **Usage:**
@@ -186,7 +193,8 @@ Scans all event directories under `data/events/` and writes two multi-page PDFs 
 
 **Output:**
 - `<qmeter>_pol_vs_freq.pdf` — Polarization vs uWaveFreq, one page per event
-- `<qmeter>_pol_vs_time.pdf` — Polarization vs row index (time proxy), one page per event
+- `<qmeter>_pol_vs_time.pdf` — Polarization vs Eastern timestamp (from `EventNum`), one page per event
+- `<qmeter>_freq_vs_time.pdf` — uWaveFreq vs Eastern timestamp (from `EventNum`), one page per event
 
 **Usage:**
 ```
@@ -216,8 +224,8 @@ Displays polarization plots for a single event and optionally writes a multi-pag
 
 **Output (saved to `validation/plots/`):**
 - `<event>_pol_vs_freq.png` — Polarization vs uWaveFreq
-- `<event>_pol_vs_time.png` — Polarization vs row index (time proxy)
-- `<event>_NMR_Signal.pdf` — one NMR raw-signal plot per row (skipped with `--no-nmr-pdf`)
+- `<event>_pol_vs_time.png` — Polarization vs Eastern timestamp (from `EventNum`)
+- `<event>_NMR_Signal.pdf` — one NMR raw-signal plot per row; only written when `--nmr` is passed
 
 **Usage:**
 ```
@@ -230,26 +238,90 @@ positional:
                            (not required when --from-candidate is used)
 
 options:
-  --from-candidate PATH N  load event_name, qmeter_name, --min-index, and
-                           --max-index from row N (0-based) of a candidates.csv
+  --from-candidate PATH [N]  load event_name, qmeter_name, --min-index, and
+                             --max-index from line N of a candidates.csv
+                             (header = line 1, first data row = line 2).
+                             Omit N to batch-plot every row.
   --events-dir DIR         root directory containing event subdirs
   --min-freq FLOAT         keep rows with uWaveFreq >= this value in GHz (default: 138.0)
   --max-freq FLOAT         keep rows with uWaveFreq <= this value in GHz
   --min-index INT          lower bound on 0-based row index
   --max-index INT          upper bound on 0-based row index (inclusive)
+  --min-time STR           lower bound on EventNum as Eastern wall-clock time.
+                           Accepted formats:
+                             "YYYY-MM-DD HH:MM[:SS]"  e.g. "2004-04-09 13:00"
+                             "YYYY-Mon-DD_HHMM"       e.g. "2004-Apr-09_1300"
+                           Intersected with --min-index when both are given.
+  --max-time STR           upper bound on EventNum (inclusive). Same formats.
+                           Intersected with --max-index when both are given.
   --output-nmr PATH        output path for NMR signal PDF
-  --no-nmr-pdf             skip generating the NMR signal PDF
+  --nmr                    generate NMR signal PDF (±5 rows around peak polarization)
   -v, --verbose            enable debug logging
 ```
 
 **Examples:**
 ```
-# inspect candidate row 0 from candidates.csv
-python validation/plot_single_event.py --from-candidate candidates.csv 0 --no-nmr-pdf
+# polarization plots only for a specific event
+python validation/plot_single_event.py "Top Proton" 2004-04-10_08h25m37s
 
-# inspect a specific event and index range directly
+# narrow by Eastern time using the compact date format; include NMR PDF
+python validation/plot_single_event.py "Top Proton" 2004-04-10_08h25m37s \
+    --min-time "2004-Apr-09_1300" --max-time "2004-Apr-09_1420" \
+    --nmr
+
+# same range with the ISO format
+python validation/plot_single_event.py "Top Proton" 2004-04-10_08h25m37s \
+    --min-time "2004-04-09 13:00" --max-time "2004-04-09 14:20" \
+    --nmr
+
+# narrow by row index directly
 python validation/plot_single_event.py "Top Proton" 2004-08-03_10h29m47s \
     --min-index 1028 --max-index 1212
+
+# review a single candidate from candidates.csv (line 2 = first data row)
+python validation/plot_single_event.py --from-candidate candidates.csv 2
+
+# review with NMR PDF
+python validation/plot_single_event.py --from-candidate candidates.csv 2 --nmr
+
+# batch-plot all candidates and write four PDFs to plots/
+python validation/plot_single_event.py --from-candidate candidates.csv --nmr
+```
+
+---
+
+## validation/time_utils.py
+
+Helpers for converting between Unix timestamps and Eastern Time (`America/New_York`,
+DST-aware). Used by the plot scripts to derive a timestamp axis from the `EventNum`
+column and to parse `--min-time`/`--max-time` arguments.
+
+**Interface:**
+```python
+from time_utils import unix_to_eastern, format_eastern, parse_eastern
+
+unix_to_eastern(1047058035)            # -> tz-aware datetime
+format_eastern(1047058035)             # -> "2003-03-07 12:27:15 EST"
+parse_eastern("2003-03-07 12:27:15")   # -> 1047058035  (ISO format)
+parse_eastern("2003-Mar-07_1227")      # -> 1047058020  (compact event format)
+```
+
+`parse_eastern` accepts any of these formats (all interpreted as `America/New_York`):
+
+| Format | Example |
+|---|---|
+| `YYYY-MM-DD HH:MM:SS` | `2004-04-09 13:00:00` |
+| `YYYY-MM-DDTHH:MM` | `2004-04-09T13:00` |
+| `YYYY-MM-DD HH:MM` | `2004-04-09 13:00` |
+| `YYYY-Mon-DD HH:MM:SS` | `2004-Apr-09 13:00:00` |
+| `YYYY-Mon-DD HH:MM` | `2004-Apr-09 13:00` |
+| `YYYY-Mon-DD_HHMM` | `2004-Apr-09_1300` |
+| `YYYY-Mon-DD_HHMMSS` | `2004-Apr-09_130045` |
+
+**Standalone CLI** — convert a Unix timestamp to an Eastern Time stamp:
+```
+python validation/time_utils.py 1047058035
+# -> 2003-03-07 12:27:15 EST
 ```
 
 ---

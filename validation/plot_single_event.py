@@ -2,24 +2,26 @@
 """Show polarization plots for a single event directory.
 
 Loads '<events_dir>/<event_name>/<event_name>.csv', filters rows for the given
-QMeterName and a tunable [min, max] uWaveFreq range, then displays:
+QMeterName and a tunable [min, max] uWaveFreq range, then saves to plots/:
 
-  * Polarization vs uWaveFreq
-  * Polarization vs row index (time proxy)
+  * <event>_pol_vs_freq.png  — Polarization vs uWaveFreq
+  * <event>_pol_vs_time.png  — Polarization vs Eastern timestamp
 
-If '<event_name>-RawSignal.csv' exists, also writes a multi-page PDF with one
-NMR raw-signal plot per row (default: '<event_name>_NMR_Signal.pdf').
+Pass --nmr to also write a PDF of NMR raw-signal traces (±5 rows around the
+peak polarization).  Accepts --min-time/--max-time in ISO format or the
+compact 'YYYY-Mon-DD_HHMM' form (e.g. '2004-Apr-09_1300').
 
-Example:
+Examples:
+    python plot_single_event.py "Top Proton" 2004-04-10_08h25m37s
+
     python plot_single_event.py "Top Proton" 2004-04-10_08h25m37s \\
-        --min-freq 140.0 --max-freq 140.3
-
-    
+        --min-time "2004-Apr-09_1300" --max-time "2004-Apr-09_1420" --nmr
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
 import csv
 import logging
 import sys
@@ -27,12 +29,16 @@ from pathlib import Path
 
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from matplotlib.backends.backend_pdf import PdfPages
 from matplotlib.ticker import FormatStrFormatter
+
+from time_utils import EASTERN, parse_eastern, format_eastern
 
 DEFAULT_MIN_FREQ = 138.0
 DEFAULT_MAX_FREQ = float("inf")
 nmr_signals = 100
+nmr_peak_window = 5  # batch mode: ±N rows around the candidate's peak
 
 DEFAULT_EVENTS_DIR = "/Users/jay/Desktop/Papers_For_PHD/Microwave paper/code/data/events"
 
@@ -43,10 +49,16 @@ def load_event_rows(event_dir: Path, qmeter_name: str,
                     min_freq: float = DEFAULT_MIN_FREQ,
                     max_freq: float = DEFAULT_MAX_FREQ,
                     min_index: int | None = None,
-                    max_index: int | None = None) -> pd.DataFrame:
-    """Load rows for qmeter_name with numeric Polarization and uWaveFreq in
-    [min_freq, max_freq], optionally restricted to row indices [min_index, max_index]
-    (inclusive, 0-based positions after the QMeter + frequency filter).
+                    max_index: int | None = None,
+                    min_time_unix: int | None = None,
+                    max_time_unix: int | None = None) -> pd.DataFrame:
+    """Load rows for qmeter_name with numeric Polarization, uWaveFreq in
+    [min_freq, max_freq], and a tz-aware Eastern Timestamp from EventNum.
+
+    Optionally restricted by row position [min_index, max_index] (inclusive,
+    0-based after the QMeter + frequency filter) and/or by EventNum Unix
+    seconds in [min_time_unix, max_time_unix]. When both kinds of filters
+    are given they are intersected.
 
     Setting min_freq == max_freq selects a single frequency.
     """
@@ -55,17 +67,27 @@ def load_event_rows(event_dir: Path, qmeter_name: str,
         raise FileNotFoundError(f"CSV not found: {csv_path}")
 
     df = pd.read_csv(csv_path, engine="python", on_bad_lines="skip")
+    # Line 1 is the header, so the first data row sits on line 2.
+    df["csv_line"] = df.index + 2
 
-    required = {"QMeterName", "Polarization", "uWaveFreq"}
+    required = {"QMeterName", "Polarization", "uWaveFreq", "EventNum"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"CSV {csv_path} missing columns: {sorted(missing)}")
 
-    matched = df.loc[df["QMeterName"] == qmeter_name, ["uWaveFreq", "Polarization"]].copy()
+    cols = ["uWaveFreq", "Polarization", "EventNum", "csv_line"]
+    matched = df.loc[df["QMeterName"] == qmeter_name, cols].copy()
     matched["uWaveFreq"] = pd.to_numeric(matched["uWaveFreq"], errors="coerce")
     matched["Polarization"] = pd.to_numeric(matched["Polarization"], errors="coerce")
-    matched = matched.dropna(subset=["uWaveFreq", "Polarization"])
+    matched["EventNum"] = pd.to_numeric(matched["EventNum"], errors="coerce")
+    matched = matched.dropna(subset=["uWaveFreq", "Polarization", "EventNum"])
     matched = matched[(matched["uWaveFreq"] >= min_freq) & (matched["uWaveFreq"] <= max_freq)]
+    if min_time_unix is not None:
+        matched = matched[matched["EventNum"] >= min_time_unix]
+    if max_time_unix is not None:
+        matched = matched[matched["EventNum"] <= max_time_unix]
+    matched["Timestamp"] = pd.to_datetime(matched["EventNum"], unit="s", utc=True
+                                          ).dt.tz_convert(EASTERN)
     matched = matched.reset_index(drop=True)
 
     if min_index is not None or max_index is not None:
@@ -73,6 +95,14 @@ def load_event_rows(event_dir: Path, qmeter_name: str,
         hi = len(matched) - 1 if max_index is None else max_index
         matched = matched.loc[(matched.index >= lo) & (matched.index <= hi)]
     return matched
+
+
+def _raw_signal_index_for(event_dir: Path, target_event_num: int) -> int | None:
+    """Return the 0-based row index in the RawSignal CSV whose event number (col 0) matches."""
+    df = load_raw_signal_rows(event_dir)
+    nums = pd.to_numeric(df.iloc[:, 0], errors="coerce")
+    hits = (nums == target_event_num).to_numpy().nonzero()[0]
+    return int(hits[0]) if len(hits) else None
 
 
 def load_raw_signal_rows(event_dir: Path) -> pd.DataFrame:
@@ -104,11 +134,49 @@ def plot_raw_signal(channels: pd.Series, title: str, event_number: int,
     ax.set_xlabel("NMR channel")
     ax.set_ylabel("Signal")
     ax.grid(True, alpha=0.3)
-    ax.text(0.99, 0.01, f"Event: {event_number}  (n={len(channels)})",
+    eastern_str = format_eastern(event_number)
+    ax.text(0.99, 0.01, f"Event: {event_number}  |  {eastern_str}  (n={len(channels)})",
             transform=ax.transAxes, ha="right", va="bottom", fontsize=8,
             color="gray")
     fig.tight_layout()
     return fig
+
+
+def _write_nmr_pages(out: PdfPages, event_dir: Path,
+                     min_index: int | None = None,
+                     max_index: int | None = None,
+                     limit: int | None = None,
+                     title_prefix: str | None = None) -> int:
+    """Append NMR pages from event_dir's RawSignal CSV to an open PdfPages.
+
+    Returns pages written. `limit` (if not None) caps how many rows are taken
+    from the sliced range.
+    """
+    df = load_raw_signal_rows(event_dir)
+    if min_index is not None or max_index is not None:
+        lo = 0 if min_index is None else max(0, min_index)
+        hi = len(df) - 1 if max_index is None else max_index
+        df = df.iloc[lo:hi + 1]
+    if limit is not None and limit >= 0:
+        df = df.head(limit)
+
+    pages = 0
+    for row in df.itertuples(index=True, name=None):
+        row_index, event_number_raw, *channel_values = row
+        try:
+            event_number = int(float(event_number_raw))
+        except (TypeError, ValueError):
+            logger.debug("skipping raw row in %s: bad event number %r",
+                         event_dir.name, event_number_raw)
+            continue
+        channels = pd.to_numeric(pd.Series(channel_values), errors="coerce")
+        title = title_prefix or f"{event_dir.name}  (event {event_number})"
+        fig = plot_raw_signal(channels, title, event_number, row_index=row_index)
+        if fig is not None:
+            out.savefig(fig)
+            plt.close(fig)
+            pages += 1
+    return pages
 
 
 def build_nmr_pdf(event_dir: Path, pdf_path: Path,
@@ -121,38 +189,32 @@ def build_nmr_pdf(event_dir: Path, pdf_path: Path,
     CSV by 0-based row position (inclusive bounds) and `limit` is ignored.
     Otherwise the first `limit` rows are used.
     """
-    df = load_raw_signal_rows(event_dir)
-    if min_index is not None or max_index is not None:
-        lo = 0 if min_index is None else max(0, min_index)
-        hi = len(df) - 1 if max_index is None else max_index
-        df = df.iloc[lo:hi + 1]
-    elif limit is not None and limit >= 0:
-        df = df.head(limit)
     pdf_path.parent.mkdir(parents=True, exist_ok=True)
-
-    pages = 0
+    sliced = (min_index is not None or max_index is not None)
+    effective_limit = None if sliced else limit
     with PdfPages(pdf_path) as out:
-        for row in df.itertuples(index=True, name=None):
-            row_index, event_number_raw, *channel_values = row
-            try:
-                event_number = int(float(event_number_raw))
-            except (TypeError, ValueError):
-                logger.debug("skipping raw row in %s: bad event number %r",
-                             event_dir.name, event_number_raw)
-                continue
-            channels = pd.to_numeric(pd.Series(channel_values), errors="coerce")
-            fig = plot_raw_signal(
-                channels,
-                f"{event_dir.name}  (event {event_number})",
-                event_number,
-                row_index=row_index,
-            )
-            if fig is not None:
-                out.savefig(fig)
-                plt.close(fig)
-                pages += 1
+        pages = _write_nmr_pages(out, event_dir,
+                                 min_index=min_index, max_index=max_index,
+                                 limit=effective_limit)
         out.infodict()["Title"] = f"NMR raw signal — {event_dir.name}"
     return pages
+
+
+def _add_index_axis(ax: plt.Axes, n: int, start: int = 0, end: int | None = None) -> None:
+    """Attach a secondary x-axis at the bottom of *ax* showing CSV line numbers.
+
+    *start* and *end* are the first and last line numbers of the data window.
+    *end* defaults to ``start + n - 1`` when omitted.
+    """
+    hi = end if end is not None else start + n - 1
+    ax2 = ax.twiny()
+    ax2.set_xlim(start, max(hi, start + 1))
+    ax2.xaxis.set_ticks_position("bottom")
+    ax2.xaxis.set_label_position("bottom")
+    ax2.spines["bottom"].set_position(("outward", 48))
+    ax2.spines["top"].set_visible(False)
+    ax2.set_xlabel("Line", fontsize=9)
+    ax2.tick_params(axis="x", labelsize=8)
 
 
 def plot_pol_vs_freq(rows: pd.DataFrame, title: str, qmeter_name: str) -> plt.Figure:
@@ -161,30 +223,76 @@ def plot_pol_vs_freq(rows: pd.DataFrame, title: str, qmeter_name: str) -> plt.Fi
     ax.plot(pairs["uWaveFreq"], pairs["Polarization"], marker="o", linestyle="-",
             markersize=3, linewidth=0.8)
     ax.set_title(title)
-    ax.set_xlabel("uWaveFreq (GHz)")
+    ax.set_xlabel("uWaveFreq (GHz)", labelpad=30)
     ax.set_ylabel("Polarization")
     ax.xaxis.set_major_formatter(FormatStrFormatter("%.6f"))
     plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
     ax.grid(True, alpha=0.3)
-    ax.text(0.99, 0.01, f"QMeter: {qmeter_name}  (n={len(pairs)})",
+    start_ts = rows["Timestamp"].min()
+    start_str = start_ts.strftime("%Y-%m-%d %H:%M %Z")
+    ax.text(0.99, 0.01,
+            f"QMeter: {qmeter_name}  |  Start date: {start_str}  (n={len(pairs)})",
             transform=ax.transAxes, ha="right", va="bottom", fontsize=8,
             color="gray")
+    line_start = int(pairs["csv_line"].min()) if not pairs.empty else 0
+    line_end   = int(pairs["csv_line"].max()) if not pairs.empty else 0
+    _add_index_axis(ax, len(pairs), start=line_start, end=line_end)
     fig.tight_layout()
+    fig.subplots_adjust(bottom=0.22)
     return fig
+
+
+def _format_time_axis(ax) -> None:
+    locator = mdates.AutoDateLocator()
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator, tz=EASTERN))
+    plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
 
 
 def plot_pol_vs_time(rows: pd.DataFrame, title: str, qmeter_name: str) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(8.5, 5.5))
-    ax.plot(rows.index, rows["Polarization"].values, marker="o", linestyle="-",
+    ax.plot(rows["Timestamp"], rows["Polarization"], marker="o", linestyle="-",
             markersize=3, linewidth=0.8)
     ax.set_title(title)
-    ax.set_xlabel("Row index (time)")
+    ax.set_xlabel("Time (Eastern)")
     ax.set_ylabel("Polarization")
+    _format_time_axis(ax)
     ax.grid(True, alpha=0.3)
-    ax.text(0.99, 0.01, f"QMeter: {qmeter_name}  (n={len(rows)})",
+    start_ts = rows["Timestamp"].min()
+    start_str = start_ts.strftime("%Y-%m-%d %H:%M %Z")
+    ax.text(0.99, 0.01,
+            f"QMeter: {qmeter_name}  |  Start date: {start_str}  (n={len(rows)})",
             transform=ax.transAxes, ha="right", va="bottom", fontsize=8,
             color="gray")
+    line_start = int(rows["csv_line"].min()) if not rows.empty else 0
+    line_end   = int(rows["csv_line"].max()) if not rows.empty else 0
+    _add_index_axis(ax, len(rows), start=line_start, end=line_end)
     fig.tight_layout()
+    fig.subplots_adjust(bottom=0.22)
+    return fig
+
+
+def plot_freq_vs_time(rows: pd.DataFrame, title: str, qmeter_name: str) -> plt.Figure:
+    fig, ax = plt.subplots(figsize=(8.5, 5.5))
+    ax.plot(rows["Timestamp"], rows["uWaveFreq"], marker="o", linestyle="-",
+            markersize=3, linewidth=0.8)
+    ax.set_title(title)
+    ax.set_xlabel("Time (Eastern)")
+    ax.set_ylabel("uWaveFreq (GHz)")
+    ax.yaxis.set_major_formatter(FormatStrFormatter("%.6f"))
+    _format_time_axis(ax)
+    ax.grid(True, alpha=0.3)
+    start_ts = rows["Timestamp"].min()
+    start_str = start_ts.strftime("%Y-%m-%d %H:%M %Z")
+    ax.text(0.99, 0.01,
+            f"QMeter: {qmeter_name}  |  Start date: {start_str}  (n={len(rows)})",
+            transform=ax.transAxes, ha="right", va="bottom", fontsize=8,
+            color="gray")
+    line_start = int(rows["csv_line"].min()) if not rows.empty else 0
+    line_end   = int(rows["csv_line"].max()) if not rows.empty else 0
+    _add_index_axis(ax, len(rows), start=line_start, end=line_end)
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.22)
     return fig
 
 
@@ -248,12 +356,23 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                         help="keep only rows whose 0-based index is <= this "
                              "value (inclusive). When set, also overrides the "
                              "nmr_signals cap for slicing the RawSignal CSV.")
+    parser.add_argument("--min-time", type=str, default=None,
+                        help="keep only rows whose EventNum (Eastern time) is "
+                             ">= this value. Accepted formats: "
+                             "'YYYY-MM-DD HH:MM[:SS]', 'YYYY-MM-DDTHH:MM', "
+                             "or 'YYYY-Mon-DD_HHMM' (e.g. '2004-Apr-09_1300'). "
+                             "Interpreted as America/New_York (EST/EDT).")
+    parser.add_argument("--max-time", type=str, default=None,
+                        help="keep only rows whose EventNum (Eastern time) is "
+                             "<= this value. Same formats as --min-time. "
+                             "Intersected with --min-index/--max-index when both "
+                             "are given.")
     parser.add_argument("--output-nmr", type=Path, default=None,
                         help="output PDF for NMR raw-signal pages, one per row of "
                              "<event_name>-RawSignal.csv "
                              "(default: <event_name>_NMR_Signal.pdf in cwd)")
-    parser.add_argument("--no-nmr-pdf", action="store_true",
-                        help="skip generating the NMR signal PDF")
+    parser.add_argument("--nmr", action="store_true",
+                        help="generate NMR signal PDF (±%d rows around peak polarization)" % nmr_peak_window)
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="enable debug logging")
     return parser.parse_args(argv)
@@ -284,30 +403,46 @@ def main(argv: list[str] | None = None) -> int:
                 logger.error("no candidates found in %s", csv_path_str)
                 return 2
 
-            plots_dir = Path("plots")
+            plots_dir = Path(__file__).parent / "plots"
             plots_dir.mkdir(exist_ok=True)
             csv_stem = Path(csv_path_str).stem
             freq_pdf_path = plots_dir / f"{csv_stem}_pol_vs_freq.pdf"
             time_pdf_path = plots_dir / f"{csv_stem}_pol_vs_time.pdf"
-            freq_pages = time_pages = 0
+            freq_time_pdf_path = plots_dir / f"{csv_stem}_freq_vs_time.pdf"
+            nmr_pdf_path = plots_dir / f"{csv_stem}_nmr_signals.pdf"
+            freq_pages = time_pages = freq_time_pages = nmr_pages = 0
 
-            with PdfPages(freq_pdf_path) as freq_out, PdfPages(time_pdf_path) as time_out:
+            with contextlib.ExitStack() as stack:
+                freq_out = stack.enter_context(PdfPages(freq_pdf_path))
+                time_out = stack.enter_context(PdfPages(time_pdf_path))
+                freq_time_out = stack.enter_context(PdfPages(freq_time_pdf_path))
+                nmr_out = stack.enter_context(PdfPages(nmr_pdf_path)) if args.nmr else None
+
                 for i, cand in enumerate(all_cands):
                     cand_qmeter = cand["qmeter_name"]
                     cand_event = cand["event_name"]
-                    cand_min_idx = int(cand["start_index"])
-                    cand_max_idx = int(cand["end_index"])
+                    cand_start_line = int(cand["start_line"])
+                    cand_end_line = int(cand["end_line"])
                     event_dir = args.events_dir / cand_event
                     if not event_dir.is_dir():
                         logger.warning("event directory not found: %s — skipping", event_dir)
                         continue
                     try:
-                        rows = load_event_rows(event_dir, cand_qmeter,
-                                               min_freq=args.min_freq, max_freq=args.max_freq,
-                                               min_index=cand_min_idx, max_index=cand_max_idx)
+                        all_filtered = load_event_rows(event_dir, cand_qmeter,
+                                                       min_freq=args.min_freq, max_freq=args.max_freq)
                     except (FileNotFoundError, ValueError) as exc:
                         logger.warning("skipping %s: %s", cand_event, exc)
                         continue
+                    hits_s = all_filtered.index[all_filtered["csv_line"] == cand_start_line]
+                    hits_e = all_filtered.index[all_filtered["csv_line"] == cand_end_line]
+                    if len(hits_s) == 0 or len(hits_e) == 0:
+                        logger.warning("lines %d-%d not in %s [%s] — skipping",
+                                       cand_start_line, cand_end_line, cand_event, cand_qmeter)
+                        continue
+                    cand_min_idx = int(hits_s[0])
+                    cand_max_idx = int(hits_e[0])
+                    rows = all_filtered.loc[(all_filtered.index >= cand_min_idx)
+                                            & (all_filtered.index <= cand_max_idx)]
                     if rows.empty:
                         logger.warning("no matching rows for %s [%s] — skipping",
                                        cand_event, cand_qmeter)
@@ -325,18 +460,52 @@ def main(argv: list[str] | None = None) -> int:
                     time_out.savefig(time_fig)
                     plt.close(time_fig)
                     time_pages += 1
+                    freq_time_fig = plot_freq_vs_time(rows, title, cand_qmeter)
+                    freq_time_out.savefig(freq_time_fig)
+                    plt.close(freq_time_fig)
+                    freq_time_pages += 1
+                    if args.nmr and nmr_out is not None:
+                        try:
+                            direction = int(cand.get("direction") or 0)
+                        except ValueError:
+                            direction = 0
+                        if direction == -1:
+                            peak_idx = int(rows["Polarization"].idxmin())
+                        else:
+                            peak_idx = int(rows["Polarization"].idxmax())
+                        nmr_lo = peak_idx - nmr_peak_window
+                        nmr_hi = peak_idx + nmr_peak_window
+                        try:
+                            written = _write_nmr_pages(
+                                nmr_out, event_dir,
+                                min_index=nmr_lo, max_index=nmr_hi,
+                                limit=None,
+                                title_prefix=f"{cand_event}  [{cand_qmeter}]  peak@{peak_idx}",
+                            )
+                            nmr_pages += written
+                        except (FileNotFoundError, ValueError) as exc:
+                            logger.warning("skipping NMR for %s: %s", cand_event, exc)
                     logger.debug("processed row %d: %s [%s]", i + 2, cand_event, cand_qmeter)
                 freq_out.infodict()["Title"] = f"Polarization vs uWaveFreq — {csv_stem}"
                 time_out.infodict()["Title"] = f"Polarization vs time — {csv_stem}"
+                freq_time_out.infodict()["Title"] = f"uWaveFreq vs time — {csv_stem}"
+                if nmr_out is not None:
+                    nmr_out.infodict()["Title"] = f"NMR raw signal — {csv_stem}"
 
-            for label, path, pages in (("freq", freq_pdf_path, freq_pages),
-                                        ("time", time_pdf_path, time_pages)):
+            summaries = [("pol_vs_freq", freq_pdf_path, freq_pages),
+                         ("pol_vs_time", time_pdf_path, time_pages),
+                         ("freq_vs_time", freq_time_pdf_path, freq_time_pages)]
+            if args.nmr:
+                summaries.append(("nmr_signals", nmr_pdf_path, nmr_pages))
+            else:
+                nmr_pdf_path.unlink(missing_ok=True)
+            for label, path, pages in summaries:
                 if pages == 0:
                     logger.warning("no pages for %s PDF — removing %s", label, path)
                     path.unlink(missing_ok=True)
                 else:
                     logger.info("wrote %d page(s) to %s", pages, path)
-            return 0 if (freq_pages or time_pages) else 2
+            return 0 if (freq_pages or time_pages or freq_time_pages) else 2
 
         # single-row mode
         row_str = args.from_candidate[1]
@@ -352,12 +521,27 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         args.qmeter_name = cand["qmeter_name"]
         args.event_name = cand["event_name"]
-        args.min_index = int(cand["start_index"])
-        args.max_index = int(cand["end_index"])
+        cand_start_line = int(cand["start_line"])
+        cand_end_line = int(cand["end_line"])
+        event_dir = args.events_dir / args.event_name
+        try:
+            prelim = load_event_rows(event_dir, args.qmeter_name,
+                                     min_freq=args.min_freq, max_freq=args.max_freq)
+        except (FileNotFoundError, ValueError) as exc:
+            logger.error("%s", exc)
+            return 1
+        hits_s = prelim.index[prelim["csv_line"] == cand_start_line]
+        hits_e = prelim.index[prelim["csv_line"] == cand_end_line]
+        if len(hits_s) == 0 or len(hits_e) == 0:
+            logger.error("candidate lines %d-%d not found in %s [%s] after filter",
+                         cand_start_line, cand_end_line, args.event_name, args.qmeter_name)
+            return 1
+        args.min_index = int(hits_s[0])
+        args.max_index = int(hits_e[0])
         logger.info(
-            "Loaded candidate line %d: %s [%s] indices %s–%s",
+            "Loaded candidate line %d: %s [%s] lines %d-%d (filtered indices %s-%s)",
             row_number, args.event_name, args.qmeter_name,
-            args.min_index, args.max_index,
+            cand_start_line, cand_end_line, args.min_index, args.max_index,
         )
     elif args.qmeter_name is None or args.event_name is None:
         logger.error(
@@ -376,6 +560,22 @@ def main(argv: list[str] | None = None) -> int:
                      args.min_index, args.max_index)
         return 1
 
+    min_time_unix: int | None = None
+    max_time_unix: int | None = None
+    try:
+        if args.min_time is not None:
+            min_time_unix = parse_eastern(args.min_time)
+        if args.max_time is not None:
+            max_time_unix = parse_eastern(args.max_time)
+    except ValueError as exc:
+        logger.error("%s", exc)
+        return 1
+    if (min_time_unix is not None and max_time_unix is not None
+            and min_time_unix > max_time_unix):
+        logger.error("--min-time (%s) must not exceed --max-time (%s)",
+                     args.min_time, args.max_time)
+        return 1
+
     event_dir = args.events_dir / args.event_name
     if not event_dir.is_dir():
         logger.error("event directory not found: %s", event_dir)
@@ -384,23 +584,30 @@ def main(argv: list[str] | None = None) -> int:
     try:
         rows = load_event_rows(event_dir, args.qmeter_name,
                                min_freq=args.min_freq, max_freq=args.max_freq,
-                               min_index=args.min_index, max_index=args.max_index)
+                               min_index=args.min_index, max_index=args.max_index,
+                               min_time_unix=min_time_unix,
+                               max_time_unix=max_time_unix)
     except (FileNotFoundError, ValueError) as exc:
         logger.error("%s", exc)
         return 1
 
+    time_lo_disp = format_eastern(min_time_unix) if min_time_unix is not None else None
+    time_hi_disp = format_eastern(max_time_unix) if max_time_unix is not None else None
+
     if rows.empty:
         logger.warning("no matching rows for QMeter=%r in %s with %g <= uWaveFreq <= %g, "
-                       "index [%s, %s]",
+                       "index [%s, %s], time [%s, %s]",
                        args.qmeter_name, event_dir.name,
                        args.min_freq, args.max_freq,
-                       args.min_index, args.max_index)
+                       args.min_index, args.max_index,
+                       time_lo_disp, time_hi_disp)
         return 2
 
-    logger.info("loaded %d row(s) for %s in [%g, %g] GHz, index [%s, %s]",
+    logger.info("loaded %d row(s) for %s in [%g, %g] GHz, index [%s, %s], time [%s, %s]",
                 len(rows), event_dir.name,
                 args.min_freq, args.max_freq,
-                args.min_index, args.max_index)
+                args.min_index, args.max_index,
+                time_lo_disp, time_hi_disp)
 
     if args.min_freq == args.max_freq:
         title = f"{event_dir.name}  (f = {args.min_freq:g} GHz)"
@@ -419,20 +626,28 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("saved %s", freq_path)
     logger.info("saved %s", time_path)
 
-    if not args.no_nmr_pdf:
+    if args.nmr:
         nmr_pdf = args.output_nmr or plots_dir / f"{event_dir.name}_NMR_Signal.pdf"
         try:
-            pages = build_nmr_pdf(event_dir, nmr_pdf,
-                                  min_index=args.min_index,
-                                  max_index=args.max_index)
+            peak_event_num = int(rows.loc[rows["Polarization"].idxmax(), "EventNum"])
+            raw_idx = _raw_signal_index_for(event_dir, peak_event_num)
+            if raw_idx is None:
+                logger.warning("peak event %d not found in RawSignal CSV — skipping NMR PDF",
+                               peak_event_num)
+            else:
+                logger.info("NMR window: RawSignal rows %d–%d (peak event %d at row %d)",
+                            raw_idx - nmr_peak_window, raw_idx + nmr_peak_window,
+                            peak_event_num, raw_idx)
+                pages = build_nmr_pdf(event_dir, nmr_pdf,
+                                      min_index=raw_idx - nmr_peak_window,
+                                      max_index=raw_idx + nmr_peak_window)
+                if pages == 0:
+                    logger.warning("no NMR rows plotted — removing %s", nmr_pdf)
+                    nmr_pdf.unlink(missing_ok=True)
+                else:
+                    logger.info("wrote %d NMR page(s) to %s", pages, nmr_pdf)
         except (FileNotFoundError, ValueError) as exc:
             logger.warning("skipping NMR PDF: %s", exc)
-        else:
-            if pages == 0:
-                logger.warning("no NMR rows plotted — removing %s", nmr_pdf)
-                nmr_pdf.unlink(missing_ok=True)
-            else:
-                logger.info("wrote %d NMR page(s) to %s", pages, nmr_pdf)
 
     plt.show()
     return 0

@@ -35,7 +35,25 @@ DEFAULT_EVENTS_DIR = Path(
 )
 DEFAULT_OUTPUT_DIR = Path(__file__).parent
 CANDIDATES_FILENAME = "candidates.csv"
-
+'''
+QMeters to scan:
+  - Top Proton
+  - Bottom Proton
+  - Proton
+  - Top Deuteron
+  - Bot Deuteron
+  - Bottom Deuteron
+  - Deuteron
+  - Top NH3
+  - Top DButanol
+  - Bot DButanol
+  - Top d-Butanol
+  - Bot d-Butanol
+  - Top p-Butanol
+  - Top Xenon
+  - Bottom Xenon
+  - Cold NMR
+'''
 QMETER_CONFIG: dict[str, dict] = {
     "Top Proton": {
         "prominence": 5,
@@ -43,13 +61,25 @@ QMETER_CONFIG: dict[str, dict] = {
         "min_ramp_rows": 5,
         "monotonicity_fraction": 0.25,
     },
+     "Bottom Proton": {
+        "prominence": 5,
+        "min_swing": 10,
+        "min_ramp_rows": 5,
+        "monotonicity_fraction": 0.25,
+    },
+     "Proton": {
+        "prominence": 5,
+        "min_swing": 10,
+        "min_ramp_rows": 5,
+        "monotonicity_fraction": 0.25,
+    }
 }
 
 CANDIDATE_FIELDS = [
     "event_name",
     "qmeter_name",
-    "start_index",
-    "end_index",
+    "start_line",
+    "end_line",
     "direction",
     "start_polarization",
     "end_polarization",
@@ -67,14 +97,14 @@ logger = logging.getLogger("scan_events")
 # ---------------------------------------------------------------------------
 
 def _existing_keys(csv_path: Path) -> set[tuple]:
-    """Return (event_name, start_index, end_index) tuples already in csv_path."""
+    """Return (event_name, start_line, end_line) tuples already in csv_path."""
     if not csv_path.exists():
         return set()
     keys: set[tuple] = set()
     with csv_path.open(newline="") as fh:
         for row in csv.DictReader(fh):
             try:
-                keys.add((row["event_name"], int(row["start_index"]), int(row["end_index"])))
+                keys.add((row["event_name"], int(row["start_line"]), int(row["end_line"])))
             except (KeyError, ValueError):
                 pass
     return keys
@@ -83,23 +113,29 @@ def _existing_keys(csv_path: Path) -> set[tuple]:
 def _extract_slice(row: dict, events_dir: Path, rampups_dir: Path) -> bool:
     """Extract main CSV + RawSignal for one candidate row. Returns True on success."""
     event_dir = events_dir / row["event_name"]
+    start_line = int(row["start_line"])
+    end_line = int(row["end_line"])
     stem = build_output_stem(
         row["event_name"],
         138.0, float("inf"),
-        int(row["start_index"]), int(row["end_index"]),
+        start_line, end_line,
     )
     try:
-        df = load_event_rows(
-            event_dir, row["qmeter_name"],
-            min_index=int(row["start_index"]), max_index=int(row["end_index"]),
-        )
-        df.to_csv(rampups_dir / f"{stem}.csv", index=False)
+        all_rows = load_event_rows(event_dir, row["qmeter_name"], track_line=True)
+        hits_start = all_rows.index[all_rows["csv_line"] == start_line]
+        hits_end = all_rows.index[all_rows["csv_line"] == end_line]
+        if len(hits_start) == 0 or len(hits_end) == 0:
+            logger.warning("lines %d-%d not in %s [%s] after filter — skipping",
+                           start_line, end_line, row["event_name"], row["qmeter_name"])
+            return False
+        start_pos = int(hits_start[0])
+        end_pos = int(hits_end[0])
+
+        df = all_rows.loc[(all_rows.index >= start_pos) & (all_rows.index <= end_pos)]
+        df.drop(columns="csv_line").to_csv(rampups_dir / f"{stem}.csv", index=False)
 
         try:
-            raw = load_raw_signal_rows(
-                event_dir,
-                min_index=int(row["start_index"]), max_index=int(row["end_index"]),
-            )
+            raw = load_raw_signal_rows(event_dir, min_index=start_pos, max_index=end_pos)
             raw.to_csv(rampups_dir / f"{stem}-RawSignal.csv", index=False, header=False)
         except (FileNotFoundError, ValueError) as exc:
             logger.warning("skipping RawSignal for %s: %s", stem, exc)
@@ -125,7 +161,7 @@ def _scan_event(event_dir: Path, qmeters: dict[str, dict]) -> list[dict]:
     rows: list[dict] = []
     for qmeter_name, config in qmeters.items():
         try:
-            df = load_event_rows(event_dir, qmeter_name)
+            df = load_event_rows(event_dir, qmeter_name, track_line=True)
         except FileNotFoundError:
             logger.debug("%s: CSV not found — skipping", event_dir.name)
             return []
@@ -143,8 +179,8 @@ def _scan_event(event_dir: Path, qmeters: dict[str, dict]) -> list[dict]:
             rows.append({
                 "event_name": event_dir.name,
                 "qmeter_name": qmeter_name,
-                "start_index": c.start_index,
-                "end_index": c.end_index,
+                "start_line": int(df["csv_line"].iloc[c.start_index]),
+                "end_line": int(df["csv_line"].iloc[c.end_index]),
                 "direction": c.direction,
                 "start_polarization": c.start_polarization,
                 "end_polarization": c.end_polarization,
@@ -269,7 +305,7 @@ def main(argv: list[str] | None = None) -> int:
         rows = _scan_event(event_dir, qmeters)
         events_scanned += 1
         for row in rows:
-            key = (row["event_name"], int(row["start_index"]), int(row["end_index"]))
+            key = (row["event_name"], int(row["start_line"]), int(row["end_line"]))
             if key in existing:
                 n_dupes += 1
             else:

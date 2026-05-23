@@ -35,16 +35,22 @@ def load_event_rows(event_dir: Path, qmeter_name: str,
                     min_freq: float = DEFAULT_MIN_FREQ,
                     max_freq: float = DEFAULT_MAX_FREQ,
                     min_index: int | None = None,
-                    max_index: int | None = None) -> pd.DataFrame:
+                    max_index: int | None = None,
+                    track_line: bool = False) -> pd.DataFrame:
     """Load all columns for qmeter_name with uWaveFreq in [min_freq, max_freq],
     optionally restricted to 0-based row positions [min_index, max_index]
     (inclusive, counted after the QMeter + frequency filter).
+
+    When track_line=True, a 'csv_line' column carrying the source CSV line
+    number (header = line 1, first data row = line 2) is added before slicing.
     """
     csv_path = event_dir / f"{event_dir.name}.csv"
     if not csv_path.is_file():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
 
     df = pd.read_csv(csv_path, engine="python", on_bad_lines="skip")
+    if track_line:
+        df["csv_line"] = df.index + 2
 
     required = {"QMeterName", "Polarization", "uWaveFreq"}
     missing = required - set(df.columns)
