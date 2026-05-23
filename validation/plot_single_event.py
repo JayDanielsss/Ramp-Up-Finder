@@ -258,7 +258,27 @@ def _format_time_axis(ax) -> None:
     plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
 
 
-def plot_pol_vs_time(rows: pd.DataFrame, title: str, qmeter_name: str) -> plt.Figure:
+def _overlay_qmeter_transitions(ax: plt.Axes, rows: pd.DataFrame) -> None:
+    """Draw a red vertical line + rotated label at each QMeter change.
+
+    Requires *rows* to contain a 'QMeterName' column and a 'Timestamp'
+    column, sorted in CSV order. The first row is treated as a transition
+    so every segment gets a label.
+    """
+    if "QMeterName" not in rows.columns or rows.empty:
+        return
+    names = rows["QMeterName"]
+    is_change = names != names.shift()
+    transitions = rows.loc[is_change, ["Timestamp", "QMeterName"]]
+    for ts, name in zip(transitions["Timestamp"], transitions["QMeterName"]):
+        ax.axvline(ts, color="red", linewidth=0.8, alpha=0.7)
+        ax.text(ts, 0.98, str(name),
+                transform=ax.get_xaxis_transform(),
+                rotation=90, va="top", ha="right",
+                fontsize=8, color="red")
+
+
+def plot_pol_vs_time(rows: pd.DataFrame, title: str, qmeter_name: str | None) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(8.5, 5.5))
     ax.plot(rows["Timestamp"], rows["Polarization"], marker="o", linestyle="-",
             markersize=3, linewidth=0.8)
@@ -269,19 +289,24 @@ def plot_pol_vs_time(rows: pd.DataFrame, title: str, qmeter_name: str) -> plt.Fi
     ax.grid(True, alpha=0.3)
     start_ts = rows["Timestamp"].min()
     start_str = start_ts.strftime("%Y-%m-%d %H:%M %Z")
-    ax.text(0.99, 0.01,
-            f"QMeter: {qmeter_name}  |  Start date: {start_str}  (n={len(rows)})",
+    if "QMeterName" in rows.columns:
+        distinct = rows["QMeterName"].nunique()
+        footer = f"QMeters: {distinct}  |  Start date: {start_str}  (n={len(rows)})"
+    else:
+        footer = f"QMeter: {qmeter_name}  |  Start date: {start_str}  (n={len(rows)})"
+    ax.text(0.99, 0.01, footer,
             transform=ax.transAxes, ha="right", va="bottom", fontsize=8,
             color="gray")
     line_start = int(rows["csv_line"].min()) if not rows.empty else 0
     line_end   = int(rows["csv_line"].max()) if not rows.empty else 0
     _add_index_axis(ax, len(rows), start=line_start, end=line_end)
+    _overlay_qmeter_transitions(ax, rows)
     fig.tight_layout()
     fig.subplots_adjust(bottom=0.22)
     return fig
 
 
-def plot_freq_vs_time(rows: pd.DataFrame, title: str, qmeter_name: str) -> plt.Figure:
+def plot_freq_vs_time(rows: pd.DataFrame, title: str, qmeter_name: str | None) -> plt.Figure:
     fig, ax = plt.subplots(figsize=(8.5, 5.5))
     ax.plot(rows["Timestamp"], rows["uWaveFreq"], marker="o", linestyle="-",
             markersize=3, linewidth=0.8)
@@ -293,13 +318,18 @@ def plot_freq_vs_time(rows: pd.DataFrame, title: str, qmeter_name: str) -> plt.F
     ax.grid(True, alpha=0.3)
     start_ts = rows["Timestamp"].min()
     start_str = start_ts.strftime("%Y-%m-%d %H:%M %Z")
-    ax.text(0.99, 0.01,
-            f"QMeter: {qmeter_name}  |  Start date: {start_str}  (n={len(rows)})",
+    if "QMeterName" in rows.columns:
+        distinct = rows["QMeterName"].nunique()
+        footer = f"QMeters: {distinct}  |  Start date: {start_str}  (n={len(rows)})"
+    else:
+        footer = f"QMeter: {qmeter_name}  |  Start date: {start_str}  (n={len(rows)})"
+    ax.text(0.99, 0.01, footer,
             transform=ax.transAxes, ha="right", va="bottom", fontsize=8,
             color="gray")
     line_start = int(rows["csv_line"].min()) if not rows.empty else 0
     line_end   = int(rows["csv_line"].max()) if not rows.empty else 0
     _add_index_axis(ax, len(rows), start=line_start, end=line_end)
+    _overlay_qmeter_transitions(ax, rows)
     fig.tight_layout()
     fig.subplots_adjust(bottom=0.22)
     return fig
