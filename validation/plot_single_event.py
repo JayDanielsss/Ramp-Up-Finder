@@ -263,13 +263,15 @@ def _overlay_qmeter_transitions(ax: plt.Axes, rows: pd.DataFrame) -> None:
 
     Requires *rows* to contain a 'QMeterName' column and a 'Timestamp'
     column, sorted in CSV order. The first row is treated as a transition
-    so every segment gets a label.
+    so every segment gets a label. NaN QMeterName values are rendered as
+    "(unknown)" so they don't trigger spurious transitions.
     """
     if "QMeterName" not in rows.columns or rows.empty:
         return
-    names = rows["QMeterName"]
+    names = rows["QMeterName"].fillna("(unknown)")
     is_change = names != names.shift()
-    transitions = rows.loc[is_change, ["Timestamp", "QMeterName"]]
+    transitions = rows.loc[is_change, ["Timestamp"]].copy()
+    transitions["QMeterName"] = names.loc[is_change]
     for ts, name in zip(transitions["Timestamp"], transitions["QMeterName"]):
         ax.axvline(ts, color="red", linewidth=0.8, alpha=0.7)
         ax.text(ts, 0.98, str(name),
