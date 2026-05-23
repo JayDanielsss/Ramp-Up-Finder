@@ -45,15 +45,20 @@ DEFAULT_EVENTS_DIR = "/Users/jay/Desktop/Papers_For_PHD/Microwave paper/code/dat
 logger = logging.getLogger("plot_single_event")
 
 
-def load_event_rows(event_dir: Path, qmeter_name: str,
+def load_event_rows(event_dir: Path, qmeter_name: str | None = None,
                     min_freq: float = DEFAULT_MIN_FREQ,
                     max_freq: float = DEFAULT_MAX_FREQ,
                     min_index: int | None = None,
                     max_index: int | None = None,
                     min_time_unix: int | None = None,
                     max_time_unix: int | None = None) -> pd.DataFrame:
-    """Load rows for qmeter_name with numeric Polarization, uWaveFreq in
+    """Load rows from the event's CSV with numeric Polarization, uWaveFreq in
     [min_freq, max_freq], and a tz-aware Eastern Timestamp from EventNum.
+
+    If *qmeter_name* is a string, rows are filtered to that QMeter and the
+    returned frame does not include a QMeterName column (legacy behavior).
+    If *qmeter_name* is None, rows from every QMeter are returned and
+    QMeterName is included as a column so callers can detect transitions.
 
     Optionally restricted by row position [min_index, max_index] (inclusive,
     0-based after the QMeter + frequency filter) and/or by EventNum Unix
@@ -75,8 +80,12 @@ def load_event_rows(event_dir: Path, qmeter_name: str,
     if missing:
         raise ValueError(f"CSV {csv_path} missing columns: {sorted(missing)}")
 
-    cols = ["uWaveFreq", "Polarization", "EventNum", "csv_line"]
-    matched = df.loc[df["QMeterName"] == qmeter_name, cols].copy()
+    if qmeter_name is None:
+        cols = ["uWaveFreq", "Polarization", "EventNum", "csv_line", "QMeterName"]
+        matched = df.loc[:, cols].copy()
+    else:
+        cols = ["uWaveFreq", "Polarization", "EventNum", "csv_line"]
+        matched = df.loc[df["QMeterName"] == qmeter_name, cols].copy()
     matched["uWaveFreq"] = pd.to_numeric(matched["uWaveFreq"], errors="coerce")
     matched["Polarization"] = pd.to_numeric(matched["Polarization"], errors="coerce")
     matched["EventNum"] = pd.to_numeric(matched["EventNum"], errors="coerce")
