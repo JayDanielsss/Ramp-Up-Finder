@@ -362,7 +362,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("qmeter_name", nargs="?", default=None,
                         help='QMeterName to match exactly, e.g. "Top Proton". '
-                             'Not required when --from-candidate is used.')
+                             'Not required when --from-candidate or '
+                             '--all-qmeters is used.')
     parser.add_argument("event_name", nargs="?", default=None,
                         help='Event directory name, e.g. "2004-04-10_08h25m37s". '
                              'Not required when --from-candidate is used.')
@@ -414,6 +415,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              "(default: <event_name>_NMR_Signal.pdf in cwd)")
     parser.add_argument("--nmr", action="store_true",
                         help="generate NMR signal PDF (±%d rows around peak polarization)" % nmr_peak_window)
+    parser.add_argument("--all-qmeters", action="store_true",
+                        help="plot every QMeter in the event (no QMeter filter). "
+                             "Draws red vertical lines + rotated labels at each "
+                             "QMeter change. Emits only the time-axis PNGs "
+                             "(no pol_vs_freq, no NMR). Incompatible with a "
+                             "positional qmeter_name, --from-candidate, and --nmr.")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="enable debug logging")
     return parser.parse_args(argv)
@@ -425,6 +432,17 @@ def main(argv: list[str] | None = None) -> int:
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(levelname)s %(message)s",
     )
+
+    if args.all_qmeters:
+        if args.qmeter_name is not None:
+            logger.error("--all-qmeters cannot be combined with a positional qmeter_name")
+            return 1
+        if args.from_candidate is not None:
+            logger.error("--all-qmeters cannot be combined with --from-candidate")
+            return 1
+        if args.nmr:
+            logger.error("--all-qmeters cannot be combined with --nmr")
+            return 1
 
     # Resolve --from-candidate, overriding positionals and index args
     if args.from_candidate is not None:
@@ -584,9 +602,14 @@ def main(argv: list[str] | None = None) -> int:
             row_number, args.event_name, args.qmeter_name,
             cand_start_line, cand_end_line, args.min_index, args.max_index,
         )
+    elif args.all_qmeters:
+        if args.event_name is None:
+            logger.error("event_name is required when --all-qmeters is used.")
+            return 1
     elif args.qmeter_name is None or args.event_name is None:
         logger.error(
-            "qmeter_name and event_name are required unless --from-candidate is used."
+            "qmeter_name and event_name are required unless --from-candidate "
+            "or --all-qmeters is used."
         )
         return 1
 
@@ -622,8 +645,9 @@ def main(argv: list[str] | None = None) -> int:
         logger.error("event directory not found: %s", event_dir)
         return 1
 
+    loader_qmeter = None if args.all_qmeters else args.qmeter_name
     try:
-        rows = load_event_rows(event_dir, args.qmeter_name,
+        rows = load_event_rows(event_dir, loader_qmeter,
                                min_freq=args.min_freq, max_freq=args.max_freq,
                                min_index=args.min_index, max_index=args.max_index,
                                min_time_unix=min_time_unix,
@@ -636,9 +660,10 @@ def main(argv: list[str] | None = None) -> int:
     time_hi_disp = format_eastern(max_time_unix) if max_time_unix is not None else None
 
     if rows.empty:
-        logger.warning("no matching rows for QMeter=%r in %s with %g <= uWaveFreq <= %g, "
+        qmeter_disp = "<all>" if args.all_qmeters else repr(args.qmeter_name)
+        logger.warning("no matching rows for QMeter=%s in %s with %g <= uWaveFreq <= %g, "
                        "index [%s, %s], time [%s, %s]",
-                       args.qmeter_name, event_dir.name,
+                       qmeter_disp, event_dir.name,
                        args.min_freq, args.max_freq,
                        args.min_index, args.max_index,
                        time_lo_disp, time_hi_disp)
@@ -650,24 +675,40 @@ def main(argv: list[str] | None = None) -> int:
                 args.min_index, args.max_index,
                 time_lo_disp, time_hi_disp)
 
-    if args.min_freq == args.max_freq:
-        title = f"{event_dir.name}  (f = {args.min_freq:g} GHz)"
+    if args.all_qmeters:
+        if args.min_freq == args.max_freq:
+            title = f"{event_dir.name}  [all QMeters]  (f = {args.min_freq:g} GHz)"
+        else:
+            title = (f"{event_dir.name}  [all QMeters]  "
+                     f"({args.min_freq:g} ≤ f ≤ {args.max_freq:g} GHz)")
     else:
-        title = f"{event_dir.name}  ({args.min_freq:g} ≤ f ≤ {args.max_freq:g} GHz)"
+        if args.min_freq == args.max_freq:
+            title = f"{event_dir.name}  (f = {args.min_freq:g} GHz)"
+        else:
+            title = f"{event_dir.name}  ({args.min_freq:g} ≤ f ≤ {args.max_freq:g} GHz)"
     plots_dir = Path("plots")
     plots_dir.mkdir(exist_ok=True)
 
-    freq_fig = plot_pol_vs_freq(rows, title, args.qmeter_name)
-    time_fig = plot_pol_vs_time(rows, title, args.qmeter_name)
+    if args.all_qmeters:
+        pol_time_fig = plot_pol_vs_time(rows, title, None)
+        freq_time_fig = plot_freq_vs_time(rows, title, None)
+        pol_time_path = plots_dir / f"{event_dir.name}_all_pol_vs_time.png"
+        freq_time_path = plots_dir / f"{event_dir.name}_all_freq_vs_time.png"
+        pol_time_fig.savefig(pol_time_path, dpi=150)
+        freq_time_fig.savefig(freq_time_path, dpi=150)
+        logger.info("saved %s", pol_time_path)
+        logger.info("saved %s", freq_time_path)
+    else:
+        freq_fig = plot_pol_vs_freq(rows, title, args.qmeter_name)
+        time_fig = plot_pol_vs_time(rows, title, args.qmeter_name)
+        freq_path = plots_dir / f"{event_dir.name}_pol_vs_freq.png"
+        time_path = plots_dir / f"{event_dir.name}_pol_vs_time.png"
+        freq_fig.savefig(freq_path, dpi=150)
+        time_fig.savefig(time_path, dpi=150)
+        logger.info("saved %s", freq_path)
+        logger.info("saved %s", time_path)
 
-    freq_path = plots_dir / f"{event_dir.name}_pol_vs_freq.png"
-    time_path = plots_dir / f"{event_dir.name}_pol_vs_time.png"
-    freq_fig.savefig(freq_path, dpi=150)
-    time_fig.savefig(time_path, dpi=150)
-    logger.info("saved %s", freq_path)
-    logger.info("saved %s", time_path)
-
-    if args.nmr:
+    if args.nmr and not args.all_qmeters:
         nmr_pdf = args.output_nmr or plots_dir / f"{event_dir.name}_NMR_Signal.pdf"
         try:
             peak_event_num = int(rows.loc[rows["Polarization"].idxmax(), "EventNum"])
