@@ -137,7 +137,7 @@ def plot_pol_vs_freq(rows: pd.DataFrame, title: str, qmeter_name: str) -> plt.Fi
 
 
 def _format_time_axis(ax) -> None:
-    locator = mdates.AutoDateLocator()
+    locator = mdates.AutoDateLocator(tz=EASTERN)
     ax.xaxis.set_major_locator(locator)
     ax.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator, tz=EASTERN))
     plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
