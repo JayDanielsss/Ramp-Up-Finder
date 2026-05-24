@@ -11,11 +11,20 @@ Pass --nmr to also write a PDF of NMR raw-signal traces (±5 rows around the
 peak polarization).  Accepts --min-time/--max-time in ISO format or the
 compact 'YYYY-Mon-DD_HHMM' form (e.g. '2004-Apr-09_1300').
 
+Pass --all-qmeters (with event_name only, no QMeterName) to plot every
+QMeter in one event together. Emits two PNGs into plots/:
+
+  * <event>_all_pol_vs_time.png  — Polarization vs time, with red vertical
+    lines + rotated labels at each QMeter change
+  * <event>_all_freq_vs_time.png — uWaveFreq vs time, same overlay
+
 Examples:
     python plot_single_event.py "Top Proton" 2004-04-10_08h25m37s
 
     python plot_single_event.py "Top Proton" 2004-04-10_08h25m37s \\
         --min-time "2004-Apr-09_1300" --max-time "2004-Apr-09_1420" --nmr
+
+    python plot_single_event.py --all-qmeters 2004-04-16_10h35m39s
 """
 
 from __future__ import annotations
@@ -366,7 +375,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
                              '--all-qmeters is used.')
     parser.add_argument("event_name", nargs="?", default=None,
                         help='Event directory name, e.g. "2004-04-10_08h25m37s". '
-                             'Not required when --from-candidate is used.')
+                             'Not required when --from-candidate is used. '
+                             'The sole positional when --all-qmeters is used.')
     parser.add_argument(
         "--from-candidate",
         nargs="+",
@@ -434,8 +444,14 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     if args.all_qmeters:
+        # argparse fills positionals left-to-right, so a single positional
+        # lands in args.qmeter_name. Reinterpret it as event_name when
+        # event_name is empty, so `--all-qmeters <event>` works as users expect.
+        if args.event_name is None and args.qmeter_name is not None:
+            args.event_name = args.qmeter_name
+            args.qmeter_name = None
         if args.qmeter_name is not None:
-            logger.error("--all-qmeters cannot be combined with a positional qmeter_name")
+            logger.error("--all-qmeters: supply only event_name, not both positionals")
             return 1
         if args.from_candidate is not None:
             logger.error("--all-qmeters cannot be combined with --from-candidate")
