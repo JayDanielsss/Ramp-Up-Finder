@@ -301,7 +301,7 @@ def plot_pol_vs_time(rows: pd.DataFrame, title: str, qmeter_name: str | None) ->
     start_ts = rows["Timestamp"].min()
     start_str = start_ts.strftime("%Y-%m-%d %H:%M %Z")
     if "QMeterName" in rows.columns:
-        distinct = rows["QMeterName"].nunique()
+        distinct = rows["QMeterName"].fillna("(unknown)").nunique()
         footer = f"QMeters: {distinct}  |  Start date: {start_str}  (n={len(rows)})"
     else:
         footer = f"QMeter: {qmeter_name}  |  Start date: {start_str}  (n={len(rows)})"
@@ -330,7 +330,7 @@ def plot_freq_vs_time(rows: pd.DataFrame, title: str, qmeter_name: str | None) -
     start_ts = rows["Timestamp"].min()
     start_str = start_ts.strftime("%Y-%m-%d %H:%M %Z")
     if "QMeterName" in rows.columns:
-        distinct = rows["QMeterName"].nunique()
+        distinct = rows["QMeterName"].fillna("(unknown)").nunique()
         footer = f"QMeters: {distinct}  |  Start date: {start_str}  (n={len(rows)})"
     else:
         footer = f"QMeter: {qmeter_name}  |  Start date: {start_str}  (n={len(rows)})"
