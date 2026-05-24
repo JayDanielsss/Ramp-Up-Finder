@@ -508,19 +508,12 @@ def main(argv: list[str] | None = None) -> int:
                     except (FileNotFoundError, ValueError) as exc:
                         logger.warning("skipping %s: %s", cand_event, exc)
                         continue
-                    hits_s = all_filtered.index[all_filtered["csv_line"] == cand_start_line]
-                    hits_e = all_filtered.index[all_filtered["csv_line"] == cand_end_line]
-                    if len(hits_s) == 0 or len(hits_e) == 0:
-                        logger.warning("lines %d-%d not in %s [%s] — skipping",
-                                       cand_start_line, cand_end_line, cand_event, cand_qmeter)
-                        continue
-                    cand_min_idx = int(hits_s[0])
-                    cand_max_idx = int(hits_e[0])
-                    rows = all_filtered.loc[(all_filtered.index >= cand_min_idx)
-                                            & (all_filtered.index <= cand_max_idx)]
+                    rows = all_filtered.loc[(all_filtered["csv_line"] >= cand_start_line)
+                                            & (all_filtered["csv_line"] <= cand_end_line)]
                     if rows.empty:
-                        logger.warning("no matching rows for %s [%s] — skipping",
-                                       cand_event, cand_qmeter)
+                        logger.warning("no surviving rows for %s [%s] in lines %d-%d — skipping",
+                                       cand_event, cand_qmeter,
+                                       cand_start_line, cand_end_line)
                         continue
                     if args.min_freq == args.max_freq:
                         title = f"{cand_event}  (f = {args.min_freq:g} GHz)  [{cand_qmeter}]"
@@ -605,14 +598,15 @@ def main(argv: list[str] | None = None) -> int:
         except (FileNotFoundError, ValueError) as exc:
             logger.error("%s", exc)
             return 1
-        hits_s = prelim.index[prelim["csv_line"] == cand_start_line]
-        hits_e = prelim.index[prelim["csv_line"] == cand_end_line]
+        hits_s = prelim.index[prelim["csv_line"] >= cand_start_line]
+        hits_e = prelim.index[prelim["csv_line"] <= cand_end_line]
         if len(hits_s) == 0 or len(hits_e) == 0:
-            logger.error("candidate lines %d-%d not found in %s [%s] after filter",
-                         cand_start_line, cand_end_line, args.event_name, args.qmeter_name)
+            logger.error("no rows survived filter in %s [%s] for lines %d-%d",
+                         args.event_name, args.qmeter_name,
+                         cand_start_line, cand_end_line)
             return 1
         args.min_index = int(hits_s[0])
-        args.max_index = int(hits_e[0])
+        args.max_index = int(hits_e[-1])
         logger.info(
             "Loaded candidate line %d: %s [%s] lines %d-%d (filtered indices %s-%s)",
             row_number, args.event_name, args.qmeter_name,

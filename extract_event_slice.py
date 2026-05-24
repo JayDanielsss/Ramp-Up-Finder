@@ -12,13 +12,26 @@ Output filenames encode the slice bounds, e.g.:
 Example:
     python extract_event_slice.py "Top Proton" 2005-03-03_10h41m57s \\
         --min-index 800 --max-index 1200
+
+Pass --from-candidate CSV_PATH [ROW_NUMBER] to drive the extraction from a
+candidates.csv (as produced by scan_events.py / used by plot_single_event.py).
+With ROW_NUMBER: extract that one candidate. Without ROW_NUMBER: extract
+every candidate. Outputs go to '<output-dir>/<candidates-stem>/' with
+filenames '<event>-<qmeter>-<start_line>-<end_line>.csv' plus a matching
+'-RawSignal.csv' (RawSignal rows are selected by EventNum, not position).
+
+Example:
+    python extract_event_slice.py --from-candidate 14NH3.csv
+    python extract_event_slice.py --from-candidate 14NH3.csv 3
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
 import sys
+from collections.abc import Iterable
 from pathlib import Path
 
 import pandas as pd
@@ -52,7 +65,7 @@ def load_event_rows(event_dir: Path, qmeter_name: str,
     if track_line:
         df["csv_line"] = df.index + 2
 
-    required = {"QMeterName", "Polarization", "uWaveFreq"}
+    required = {"QMeterName", "Polarization", "uWaveFreq", "EventNum"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"CSV {csv_path} missing columns: {sorted(missing)}")
@@ -104,12 +117,104 @@ def build_output_stem(event_name: str, min_freq: float, max_freq: float,
     return "-".join(parts)
 
 
+def _load_candidate_row(csv_path: str, row_number: int) -> dict:
+    """Read a single row from a candidates.csv by 1-based line number (header = line 1)."""
+    with open(csv_path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        rows = list(reader)
+    data_index = row_number - 2
+    if data_index < 0 or data_index >= len(rows):
+        raise IndexError(
+            f"Line {row_number} is out of range — candidates.csv has {len(rows)} data row(s) "
+            f"(valid line numbers: 2–{len(rows) + 1})"
+        )
+    return rows[data_index]
+
+
+def _load_all_candidates(csv_path: str) -> list[dict]:
+    """Read all data rows from a candidates.csv, skipping blank trailing rows."""
+    with open(csv_path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        return [r for r in reader if r.get("event_name") and r.get("qmeter_name")]
+
+
+def _sanitize_qmeter(name: str) -> str:
+    return "".join(c for c in name if c.isalnum() or c in "-_") or "qmeter"
+
+
+def load_raw_signal_by_event_nums(event_dir: Path,
+                                  event_nums: Iterable[int]) -> pd.DataFrame:
+    """Return RawSignal rows whose first column (EventNum) is in *event_nums*."""
+    csv_path = event_dir / f"{event_dir.name}-RawSignal.csv"
+    if not csv_path.is_file():
+        raise FileNotFoundError(f"RawSignal CSV not found: {csv_path}")
+
+    df = pd.read_csv(csv_path, header=None, engine="python", on_bad_lines="skip")
+    if df.shape[1] < 2:
+        raise ValueError(f"RawSignal CSV {csv_path} has too few columns: {df.shape[1]}")
+    nums = pd.to_numeric(df.iloc[:, 0], errors="coerce")
+    return df.loc[nums.isin(list(event_nums))]
+
+
+def extract_candidate_slice(event_dir: Path, qmeter_name: str,
+                            start_line: int, end_line: int,
+                            min_freq: float, max_freq: float,
+                            output_dir: Path,
+                            include_raw: bool) -> Path | None:
+    """Extract one candidate's slice; returns the main CSV path or None on skip."""
+    try:
+        rows = load_event_rows(event_dir, qmeter_name,
+                               min_freq=min_freq, max_freq=max_freq,
+                               track_line=True)
+    except (FileNotFoundError, ValueError) as exc:
+        logger.warning("skipping %s: %s", event_dir.name, exc)
+        return None
+
+    rows = rows[(rows["csv_line"] >= start_line) & (rows["csv_line"] <= end_line)]
+    if rows.empty:
+        logger.warning("no surviving rows for %s [%s] in lines %d-%d — skipping",
+                       event_dir.name, qmeter_name, start_line, end_line)
+        return None
+
+    stem = f"{event_dir.name}-{_sanitize_qmeter(qmeter_name)}-{start_line}-{end_line}"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    main_path = output_dir / f"{stem}.csv"
+    rows.to_csv(main_path, index=False)
+    logger.info("wrote %d row(s) to %s", len(rows), main_path)
+
+    if include_raw:
+        event_nums = pd.to_numeric(rows["EventNum"], errors="coerce").dropna().astype(int)
+        try:
+            raw = load_raw_signal_by_event_nums(event_dir, event_nums)
+        except (FileNotFoundError, ValueError) as exc:
+            logger.warning("skipping RawSignal for %s: %s", event_dir.name, exc)
+        else:
+            if raw.empty:
+                logger.warning("no RawSignal rows matched for %s [%s] lines %d-%d",
+                               event_dir.name, qmeter_name, start_line, end_line)
+            else:
+                raw_path = output_dir / f"{stem}-RawSignal.csv"
+                raw.to_csv(raw_path, index=False, header=False)
+                logger.info("wrote %d RawSignal row(s) to %s", len(raw), raw_path)
+    return main_path
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("qmeter_name",
-                        help='QMeterName to match exactly, e.g. "Top Proton"')
-    parser.add_argument("event_name",
-                        help='Event directory name, e.g. "2005-03-03_10h41m57s"')
+    parser.add_argument("qmeter_name", nargs="?", default=None,
+                        help='QMeterName to match exactly, e.g. "Top Proton". '
+                             'Not required when --from-candidate is used.')
+    parser.add_argument("event_name", nargs="?", default=None,
+                        help='Event directory name, e.g. "2005-03-03_10h41m57s". '
+                             'Not required when --from-candidate is used.')
+    parser.add_argument(
+        "--from-candidate", nargs="+", metavar="ARG", default=None,
+        help="CSV_PATH [ROW_NUMBER] — drive extraction from a candidates.csv "
+             "(header = line 1, first data row = line 2). With ROW_NUMBER: "
+             "extract that one candidate. Without ROW_NUMBER: extract every "
+             "candidate. Outputs go under '<output-dir>/<candidates-stem>/'. "
+             "Overrides positional args and --min-index/--max-index.",
+    )
     parser.add_argument("--events-dir", type=Path, default=DEFAULT_EVENTS_DIR,
                         help="root directory containing event subdirs")
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR,
@@ -141,6 +246,63 @@ def main(argv: list[str] | None = None) -> int:
     if args.min_freq > args.max_freq:
         logger.error("--min-freq (%g) must not exceed --max-freq (%g)",
                      args.min_freq, args.max_freq)
+        return 1
+
+    if args.from_candidate is not None:
+        if len(args.from_candidate) > 2:
+            logger.error("--from-candidate takes 1 or 2 arguments: CSV_PATH [ROW_NUMBER]")
+            return 1
+        csv_path_str = args.from_candidate[0]
+        if len(args.from_candidate) == 2:
+            try:
+                row_number = int(args.from_candidate[1])
+            except ValueError:
+                logger.error("ROW_NUMBER must be an integer, got %r",
+                             args.from_candidate[1])
+                return 1
+            try:
+                cands = [_load_candidate_row(csv_path_str, row_number)]
+            except (FileNotFoundError, IndexError) as exc:
+                logger.error("%s", exc)
+                return 1
+        else:
+            try:
+                cands = _load_all_candidates(csv_path_str)
+            except FileNotFoundError as exc:
+                logger.error("%s", exc)
+                return 1
+            if not cands:
+                logger.error("no candidates found in %s", csv_path_str)
+                return 2
+
+        out_root = args.output_dir / Path(csv_path_str).stem
+        wrote = 0
+        for cand in cands:
+            cand_event = cand.get("event_name", "")
+            cand_qmeter = cand.get("qmeter_name", "")
+            try:
+                start_line = int(cand["start_line"])
+                end_line = int(cand["end_line"])
+            except (KeyError, ValueError):
+                logger.warning("malformed candidate row %r — skipping", cand)
+                continue
+            event_dir = args.events_dir / cand_event
+            if not event_dir.is_dir():
+                logger.warning("event directory not found: %s — skipping", event_dir)
+                continue
+            if extract_candidate_slice(
+                event_dir, cand_qmeter, start_line, end_line,
+                min_freq=args.min_freq, max_freq=args.max_freq,
+                output_dir=out_root,
+                include_raw=not args.no_raw_signal,
+            ) is not None:
+                wrote += 1
+        logger.info("extracted %d of %d candidate(s) into %s",
+                    wrote, len(cands), out_root)
+        return 0 if wrote else 2
+
+    if args.qmeter_name is None or args.event_name is None:
+        logger.error("qmeter_name and event_name are required unless --from-candidate is used")
         return 1
 
     if (args.min_index is not None and args.max_index is not None
